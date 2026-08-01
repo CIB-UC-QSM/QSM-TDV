@@ -56,9 +56,8 @@ def create_synthetic_sample(
     susceptibility_batch = jnp.asarray(susceptibility[None, ..., None])
     clean_field = np.asarray(apply_dipole(susceptibility_batch, kernel))[0, ..., 0]
     noisy_field = clean_field + noise_std * rng.normal(size=shape_zyx).astype(np.float32) * brain
-    # TDV-QSM uses a fixed zero susceptibility initialisation, independent of
-    # the measured field.  The field enters through the semi-implicit RHS.
-    chi_init = np.zeros(shape_zyx, dtype=np.float32)
+    # No magnitude is available, so W=brain and chi_0=W*local_field.
+    chi_init = brain * noisy_field
 
     np.savez_compressed(
         output,
@@ -87,7 +86,7 @@ def create_synthetic_sample(
         "susceptibility_units": "ppm",
         "susceptibility_reference": "mean-zero within brain_mask",
         "boundary_condition": "periodic Fourier dipole operator; zero-padded TDV convolutions",
-        "initialization": "chi_0 is the zero susceptibility volume",
+        "initialization": "chi_0 = W * local_field, W = brain_mask (magnitude unavailable)",
         "configuration": configuration,
         "configuration_hash": _configuration_hash(configuration),
     }

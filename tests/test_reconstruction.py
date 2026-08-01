@@ -6,6 +6,7 @@ from qsm_tdv.physics.dipole import apply_dipole, dipole_kernel
 from qsm_tdv.physics.reconstruction import (
     ReconstructionConfig,
     cg_residuals_within_tolerance,
+    data_consistency,
     data_rhs,
     data_normal,
     fixed_cg,
@@ -55,6 +56,21 @@ def test_semi_implicit_equation_residual_is_small():
     relative = jnp.linalg.norm(residual) / (jnp.linalg.norm(rhs) + 1e-8)
     assert float(relative) < 2e-5
     assert bool(cg_residuals_within_tolerance(diagnostics, reconstruction_config))
+
+
+def test_data_consistency_is_the_weighted_residual_norm():
+    shape = (4, 4, 4)
+    chi = jnp.arange(64, dtype=jnp.float32).reshape(1, *shape, 1) / 100.0
+    local_field = jnp.full_like(chi, 0.02)
+    mask = jnp.zeros_like(chi).at[:, :2, :, :, :].set(1.0)
+    magnitude = jnp.linspace(0.25, 1.0, chi.size, dtype=jnp.float32).reshape(chi.shape)
+    weight = mask * magnitude
+    kernel = dipole_kernel(shape)
+
+    expected = jnp.linalg.norm((weight * (apply_dipole(chi, kernel) - local_field)).reshape(1, -1), axis=1)
+    actual = data_consistency(chi, local_field, kernel, statistical_weight=weight)
+
+    assert float(jnp.max(jnp.abs(actual - expected))) < 1e-7
 
 
 def test_reconstruction_trajectory_retains_initial_and_each_solver_state():

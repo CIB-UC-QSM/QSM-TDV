@@ -9,7 +9,7 @@ import pickle
 from pathlib import Path
 
 import jax
-from qsm_tdv.data.contract import load_single_sample
+from qsm_tdv.data.contract import effective_data_weight, load_single_sample
 from qsm_tdv.data.cosmos import CosmosSimulationConfig, prepare_cosmos_overfit_sample
 from qsm_tdv.evaluation.slices import save_orthogonal_reconstruction_slices
 from qsm_tdv.models.tdv import TDVConfig
@@ -40,6 +40,12 @@ def main() -> None:
     parser.add_argument("--log-every", type=int, default=1, help="Persist every epoch in convergence.csv")
     parser.add_argument("--epoch-chunk-size", type=int, default=2, help="Static JAX updates per synchronized chunk")
     parser.add_argument("--remat-force", action="store_true")
+    parser.add_argument(
+        "--include-magnitude-in-weight",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use W = mask * magnitude in the COSMOS data term (default: enabled)",
+    )
     parser.add_argument("--resume", action="store_true", help="Resume TDV parameters and Adam state from output-dir/checkpoint.pkl")
     arguments = parser.parse_args()
 
@@ -97,6 +103,7 @@ def main() -> None:
         log_every=arguments.log_every,
         supervised_metric="nrmse",
         epoch_chunk_size=arguments.epoch_chunk_size,
+        include_magnitude_in_weight=arguments.include_magnitude_in_weight,
     )
     def show_progress(record: dict[str, float]) -> None:
         print(
@@ -121,8 +128,13 @@ def main() -> None:
     if original_input_nrmse is None:
         original_input_nrmse = float(result.baseline_nrmse)
     save_training_result(result, sample, tdv_config, reconstruction_config, overfit_config, arguments.output_dir)
+    figure_weight = effective_data_weight(
+        sample.brain_mask,
+        sample.magnitude,
+        include_magnitude=arguments.include_magnitude_in_weight,
+    )
     figure_path = save_orthogonal_reconstruction_slices(
-        sample.chi_init * 0.0,
+        figure_weight * sample.local_field,
         result.reconstruction,
         sample.susceptibility,
         sample.brain_mask,

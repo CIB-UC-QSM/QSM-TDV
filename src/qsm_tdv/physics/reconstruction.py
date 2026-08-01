@@ -136,6 +136,28 @@ def data_fidelity(
     return 0.5 * jnp.sum(residual**2, axis=(1, 2, 3, 4))
 
 
+def data_consistency(
+    chi: Array,
+    local_field: Array,
+    kernel: Array,
+    statistical_weight: Array | None = None,
+) -> Array:
+    """Return ``||W (A chi - b)||_2`` once per batch element.
+
+    This is the weighted residual norm used for reporting and the optional
+    training consistency penalty.  The semi-implicit solver continues to use
+    the quadratic data-fidelity energy, whose linear gradient is required for
+    its Hermitian positive-definite CG system.
+    """
+
+    residual = apply_dipole(chi, kernel) - local_field
+    if statistical_weight is not None:
+        if statistical_weight.shape != residual.shape:
+            raise ValueError("statistical_weight must have the same NDHWC shape as its input")
+        residual = residual * statistical_weight.astype(residual.dtype)
+    return jnp.sqrt(jnp.sum(residual**2, axis=(1, 2, 3, 4)))
+
+
 def data_fidelity_gradient(
     chi: Array,
     local_field: Array,

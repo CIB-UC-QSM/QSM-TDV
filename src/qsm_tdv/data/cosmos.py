@@ -132,9 +132,8 @@ def prepare_cosmos_overfit_sample(
     noisy_signal = clean_signal + complex_noise
     local_field = -np.angle(noisy_signal).astype(np.float32) / config.phase_scale_radians_per_susceptibility_unit
     local_field *= mask
-    # The reconstruction always begins from chi_0 = 0; b is used only through
-    # the explicit data-fidelity right-hand side in every TDV-QSM step.
-    chi_init = np.zeros_like(chi, dtype=np.float32)
+    # Initialise with chi_0 = W * phase_in, W = mask * magnitude.
+    chi_init = mask * magnitude * local_field
 
     np.savez_compressed(
         output,
@@ -144,6 +143,7 @@ def prepare_cosmos_overfit_sample(
         brain_mask=mask[..., None],
         reference_mask=mask[..., None],
         magnitude=magnitude[..., None],
+        statistical_weight=(mask * magnitude)[..., None],
         clean_local_field=clean_field[..., None],
         clean_signal=clean_signal[..., None],
         noisy_signal=noisy_signal[..., None],
@@ -165,7 +165,8 @@ def prepare_cosmos_overfit_sample(
         "susceptibility_reference": "as supplied by chi_cosmos.mat; no re-referencing applied",
         "phase_units": "radians",
         "forward_boundary_condition": "periodic unitary Fourier dipole operator",
-        "initialization": "chi_0 is the zero susceptibility volume",
+        "initialization": "chi_0 = W * local_field, W = brain_mask * magnitude",
+        "data_weight": "W = brain_mask * magnitude",
         "noise_model": "circular complex Gaussian; realised in-mask L2 SNR",
         "requested_snr": config.snr,
         "realised_snr": realised_snr,

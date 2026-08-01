@@ -8,17 +8,23 @@ The NPZ uses float32 unbatched `[Z,Y,X,1]` arrays:
 
 - `local_field`: measured local field, \(b\);
 - `susceptibility`: reference susceptibility, \(\chi_{ref}\);
-- `chi_init`: legacy compatibility array; newly generated samples store zeros.
-  The loader always emits a zero volume for (chi_0), ignoring any nonzero
-  value in older files;
+- `chi_init`: legacy compatibility array. Newly generated samples store
+  `W * local_field`; the loader derives the canonical initial state
+  χ_0 = `W * local_field` and ignores any stored value;
 - `brain_mask`: non-negative regularizer integration and observation mask;
 - `reference_mask` (optional): non-negative supervised-loss mask;
-- `statistical_weight` (optional): non-negative data-term multiplier \(W\).
+- `magnitude` (optional): non-negative magnitude map used to form the default
+  data weight \(W=\text{brain_mask}\cdot\text{magnitude}\);
+- `statistical_weight` (optional): non-negative compatibility map for custom
+  physics experiments.
 
-`statistical_weight` means \(W\), not a variance or a precision map. Its data
-term is \(\frac12\lVert WM(A\chi-b)\rVert^2\), and implementation applies
-\(M^TW^TWM\) explicitly before the dipole adjoint. A future loader that accepts
-noise variance must convert it explicitly and document the conversion.
+The default data-consistency residual is \(\lVert W(A\chi-b)\rVert_2\). If
+the magnitude map is unavailable or `--no-include-magnitude-in-weight` is
+selected, \(W=\text{brain_mask}\). The semi-implicit data energy is
+\(\frac12\lVert W(A\chi-b)\rVert^2\), and implementation applies \(W^TW\)
+explicitly before the dipole adjoint. No multiplier is folded into \(A\).
+The reconstruction initial state uses the same resolved weight map:
+\(\chi_0=W\cdot\text{phase_in}\) (or \(W\cdot b\) for prepared samples).
 
 The manifest requires these fields:
 
@@ -53,3 +59,5 @@ It computes `b=A(chi_cosmos)`, `phase=phase_scale*b`, and
 scaled to make its realised in-mask L2 SNR exactly 70 by default. The field
 given to TDV-QSM is `-angle(S_noisy)/phase_scale`, masked only as an explicit
 observation operation. No phase unwrapping is silently applied.
+The prepared COSMOS sample records `magnitude` and uses
+`W = brain_mask * magnitude` by default.

@@ -12,12 +12,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from qsm_tdv.data.contract import load_single_sample
+from qsm_tdv.data.contract import effective_data_weight, load_single_sample
 from qsm_tdv.models.tdv import TDVConfig
 from qsm_tdv.physics.dipole import dipole_kernel
 from qsm_tdv.physics.reconstruction import (
     ReconstructionConfig,
-    data_fidelity,
+    data_consistency,
     reconstruct,
     require_cg_residuals_within_tolerance,
 )
@@ -48,6 +48,12 @@ def main() -> None:
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True, help="Trusted local checkpoint.pkl from train_single_dataset.py")
     parser.add_argument("--output-dir", type=Path, default=Path("runs/validation"))
+    parser.add_argument(
+        "--include-magnitude-in-weight",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use W = brain_mask * magnitude when the sample provides magnitude (default: enabled)",
+    )
     arguments = parser.parse_args()
 
     sample = load_single_sample(arguments.dataset)
@@ -61,13 +67,16 @@ def main() -> None:
     batch = sample.as_batch()
     local_field = batch["local_field"]
     reference = batch["susceptibility"]
-    # Evaluation matches training: chi_0 is fixed to the zero volume rather
-    # than an adjoint-field initialisation stored in a legacy sample.
-    chi_init = jnp.zeros_like(local_field) if local_field is not None else None
     brain_mask = batch["brain_mask"]
     reference_mask = batch["reference_mask"] if batch["reference_mask"] is not None else brain_mask
-    if local_field is None or reference is None or chi_init is None or brain_mask is None or reference_mask is None:
+    if local_field is None or reference is None or brain_mask is None or reference_mask is None:
         raise RuntimeError("Validated sample has a missing required tensor")
+    data_weight = effective_data_weight(
+        brain_mask,
+        batch["magnitude"],
+        include_magnitude=arguments.include_magnitude_in_weight,
+    )
+    chi_init = data_weight * local_field
     kernel = dipole_kernel(
         tuple(local_field.shape[1:4]), sample.metadata.voxel_size_zyx, sample.metadata.b0_direction_zyx
     )
@@ -80,27 +89,26 @@ def main() -> None:
         tdv_config,
         reconstruction_config,
         regularizer_mask=brain_mask,
-        observation_mask=brain_mask,
-        statistical_weight=batch["statistical_weight"],
+        statistical_weight=data_weight,
     )
     require_cg_residuals_within_tolerance(diagnostics, reconstruction_config)
     mse = masked_mse(reconstruction, reference, reference_mask)
     normalized_error = nrmse(reconstruction, reference, reference_mask)
-    fidelity = jnp.mean(
-        data_fidelity(
+    consistency = jnp.mean(
+        data_consistency(
             reconstruction,
             local_field,
             kernel,
-            observation_mask=brain_mask,
-            statistical_weight=batch["statistical_weight"],
+            statistical_weight=data_weight,
         )
-    ) / jnp.maximum(jnp.sum(brain_mask), 1.0)
+    )
     arguments.output_dir.mkdir(parents=True, exist_ok=True)
     np.save(arguments.output_dir / "reconstruction.npy", np.asarray(reconstruction[0]))
     report = {
         "mse": float(mse),
         "nrmse": float(normalized_error),
-        "data_fidelity": float(fidelity),
+        "data_consistency": float(consistency),
+        "data_weight": "mask*magnitude" if arguments.include_magnitude_in_weight and batch["magnitude"] is not None else "mask",
         "stopping_time": float(diagnostics.time),
         "max_cg_relative_residual": float(jnp.max(diagnostics.relative_residuals)),
         "dataset_manifest": sample.manifest,

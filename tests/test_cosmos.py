@@ -38,7 +38,13 @@ def test_cosmos_complex_signal_simulation_snr_and_slice_figure(tmp_path):
         noisy_signal = archive["noisy_signal"][..., 0]
     realised_snr = np.linalg.norm((clean_signal * mask).ravel()) / np.linalg.norm(((noisy_signal - clean_signal) * mask).ravel())
     assert sample.susceptibility.shape == (8, 8, 8, 1)
-    assert float(np.max(np.abs(sample.chi_init))) == 0.0
+    assert sample.magnitude is not None
+    assert sample.statistical_weight is not None
+    assert np.max(np.abs(sample.chi_init - sample.brain_mask * sample.magnitude * sample.local_field)) == 0.0
+    assert np.max(
+        np.abs(np.asarray(sample.as_batch()["chi_init"])[0] - sample.brain_mask * sample.magnitude * sample.local_field)
+    ) == 0.0
+    assert np.max(np.abs(sample.statistical_weight - sample.brain_mask * sample.magnitude)) == 0.0
     assert abs(realised_snr - 70.0) < 2e-4
     assert abs(manifest["realised_snr"] - 70.0) < 2e-4
     assert manifest["noise_model"].startswith("circular complex Gaussian")
@@ -76,7 +82,9 @@ def test_evaluation_input_prefers_phase_and_simulates_when_only_chi_is_available
     phase_dir = tmp_path / "phase"
     phase_dir.mkdir()
     phase = np.full(shape, 0.25, dtype=np.float32)
+    magnitude = np.full(shape, 0.75, dtype=np.float32)
     savemat(phase_dir / "phase_in.mat", {"phase_in": phase})
+    savemat(phase_dir / "magn.mat", {"magn": magnitude})
     savemat(phase_dir / "msk.mat", {"msk": mask})
     phase_input = load_evaluation_input(
         phase_dir,
@@ -85,6 +93,8 @@ def test_evaluation_input_prefers_phase_and_simulates_when_only_chi_is_available
     )
     assert phase_input.input_mode == "phase_in"
     assert phase_input.susceptibility is None
+    assert phase_input.magnitude is not None
+    assert np.max(np.abs(phase_input.magnitude - magnitude)) == 0.0
     assert np.max(np.abs(phase_input.local_field - phase)) == 0.0
     figure = save_orthogonal_evaluation_slices(
         phase,

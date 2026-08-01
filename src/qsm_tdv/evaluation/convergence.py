@@ -32,7 +32,7 @@ def save_convergence_artifacts(
     epochs = np.asarray([record["iteration"] for record in history], dtype=np.float32)
     nrmse_values = np.asarray([record["terminal_nrmse"] for record in history], dtype=np.float32)
     loss_values = np.asarray([record["loss"] for record in history], dtype=np.float32)
-    data_values = np.asarray([record["data_fidelity"] for record in history], dtype=np.float32)
+    data_values = np.asarray([record["data_consistency"] for record in history], dtype=np.float32)
     figure, axes = plt.subplots(1, 2, figsize=(10, 3.8), constrained_layout=True)
     axes[0].plot(epochs, nrmse_values, marker="o", markersize=3, label="NRMSE")
     axes[0].plot(epochs, loss_values, marker="o", markersize=3, label="training loss", alpha=0.75)
@@ -43,7 +43,7 @@ def save_convergence_artifacts(
     axes[0].legend()
     axes[1].plot(epochs, data_values, marker="o", markersize=3, color="tab:orange")
     axes[1].set_xlabel("Epoch")
-    axes[1].set_ylabel("Mean weighted data fidelity")
+    axes[1].set_ylabel(r"$\|M(A\chi-b)\|_2$")
     axes[1].set_title("Data consistency")
     axes[1].grid(alpha=0.25)
     figure_path = destination / "convergence.png"

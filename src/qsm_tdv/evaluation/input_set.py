@@ -21,6 +21,7 @@ import jax
 import numpy as np
 from scipy.io import loadmat
 
+from qsm_tdv.data.contract import effective_data_weight
 from qsm_tdv.evaluation.slices import save_orthogonal_evaluation_slices
 from qsm_tdv.models.tdv import TDVConfig
 from qsm_tdv.physics.dipole import apply_dipole, dipole_kernel
@@ -34,6 +35,7 @@ class EvaluationInput:
     local_field: np.ndarray
     brain_mask: np.ndarray
     susceptibility: np.ndarray | None
+    magnitude: np.ndarray | None
     input_mode: str
     source_files: dict[str, str]
 
@@ -78,6 +80,22 @@ def _optional_chi(data_dir: Path) -> tuple[np.ndarray | None, Path | None, str |
     return None, None, None
 
 
+def _optional_magnitude(data_dir: Path) -> tuple[np.ndarray | None, Path | None, str | None]:
+    """Load an optional real magnitude map using COSMOS-compatible names."""
+
+    candidates = (
+        (data_dir / "magn.mat", ("magn", "magnitude")),
+        (data_dir / "magnitude.mat", ("magnitude", "magn")),
+    )
+    for path, variables in candidates:
+        if path.is_file():
+            volume, variable_name = _load_mat_volume(path, variables)
+            if np.any(volume < 0):
+                raise ValueError(f"{path}:{variable_name} must be non-negative")
+            return volume, path, variable_name
+    return None, None, None
+
+
 def load_evaluation_input(
     data_dir: str | Path,
     *,
@@ -100,6 +118,7 @@ def load_evaluation_input(
         raise ValueError("msk.mat has no positive support voxels")
 
     susceptibility, chi_path, chi_variable = _optional_chi(directory)
+    magnitude, magnitude_path, magnitude_variable = _optional_magnitude(directory)
     phase_path = directory / "phase_in.mat"
     source_files = {"brain_mask": f"{directory / 'msk.mat'}:{mask_variable}"}
     if phase_path.is_file():
@@ -119,6 +138,8 @@ def load_evaluation_input(
         source_files["local_field"] = "simulated as A(chi) with the documented periodic unitary dipole model"
     if susceptibility is not None:
         source_files["susceptibility"] = f"{chi_path}:{chi_variable}"
+    if magnitude is not None:
+        source_files["magnitude"] = f"{magnitude_path}:{magnitude_variable}"
 
     expected_shape = brain_mask.shape
     if local_field.shape != expected_shape:
@@ -127,6 +148,8 @@ def load_evaluation_input(
         )
     if susceptibility is not None and susceptibility.shape != expected_shape:
         raise ValueError(f"Susceptibility shape {susceptibility.shape} does not match mask shape {expected_shape}")
+    if magnitude is not None and magnitude.shape != expected_shape:
+        raise ValueError(f"Magnitude shape {magnitude.shape} does not match mask shape {expected_shape}")
     # The observation support remains explicit in the solver.  Zeroing b
     # outside it keeps the stored input consistent with that support.
     local_field = local_field * brain_mask
@@ -134,6 +157,7 @@ def load_evaluation_input(
         local_field=local_field,
         brain_mask=brain_mask,
         susceptibility=susceptibility,
+        magnitude=magnitude,
         input_mode=input_mode,
         source_files=source_files,
     )
@@ -197,6 +221,7 @@ def evaluate_checkpoint(
     cg_iterations: int | None = None,
     voxel_size_zyx: tuple[float, float, float] | None = None,
     b0_direction_zyx: tuple[float, float, float] | None = None,
+    include_magnitude_in_weight: bool = True,
 ) -> dict[str, Any]:
     """Run one trusted checkpoint and save a prediction, metrics, and slices."""
 
@@ -219,9 +244,14 @@ def evaluate_checkpoint(
     kernel = dipole_kernel(sample.local_field.shape, resolved_voxel_size, resolved_b0_direction)
     local_field = sample.local_field[None, ..., None]
     brain_mask = sample.brain_mask[None, ..., None]
-    # The external evaluator follows the same fixed initial condition as
-    # training: chi_0 is zero, never A^H b.
-    chi_init = np.zeros_like(local_field, dtype=np.float32)
+    magnitude = None if sample.magnitude is None else sample.magnitude[None, ..., None]
+    data_weight = effective_data_weight(
+        brain_mask,
+        magnitude,
+        include_magnitude=include_magnitude_in_weight,
+    )
+    # Match training: chi_0 = W * phase_in (or W * b for simulated input).
+    chi_init = data_weight * local_field
     parameters = jax.device_put(checkpoint["parameters"])
     trajectory, diagnostics = reconstruct_trajectory(
         parameters["tdv"],
@@ -232,7 +262,7 @@ def evaluate_checkpoint(
         tdv_config,
         reconstruction_config,
         regularizer_mask=brain_mask,
-        observation_mask=brain_mask,
+        statistical_weight=data_weight,
     )
     trajectory_np = np.asarray(jax.device_get(trajectory), dtype=np.float32)
     residuals = np.asarray(jax.device_get(diagnostics.relative_residuals), dtype=np.float32)
@@ -278,6 +308,7 @@ def evaluate_checkpoint(
         "input_directory": str(Path(data_dir).resolve()),
         "input_mode": sample.input_mode,
         "source_files": sample.source_files,
+        "data_weight": "mask*magnitude" if include_magnitude_in_weight and magnitude is not None else "mask",
         "has_ground_truth": sample.susceptibility is not None,
         "voxel_size_zyx": list(resolved_voxel_size),
         "b0_direction_zyx": list(resolved_b0_direction),
@@ -337,6 +368,12 @@ def main() -> None:
         metavar=("BZ", "BY", "BX"),
         help="B0 direction in z,y,x order; defaults to the checkpoint metadata",
     )
+    parser.add_argument(
+        "--include-magnitude-in-weight",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use W = mask * magnitude when magn.mat or magnitude.mat is present (default: enabled)",
+    )
     arguments = parser.parse_args()
     report = evaluate_checkpoint(
         arguments.checkpoint,
@@ -346,6 +383,7 @@ def main() -> None:
         cg_iterations=arguments.cg_iterations,
         voxel_size_zyx=None if arguments.voxel_size is None else tuple(arguments.voxel_size),
         b0_direction_zyx=None if arguments.b0_direction is None else tuple(arguments.b0_direction),
+        include_magnitude_in_weight=arguments.include_magnitude_in_weight,
     )
     print(json.dumps(report, indent=2, sort_keys=True))
 

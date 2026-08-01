@@ -20,13 +20,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from qsm_tdv.data.contract import QSMSample, load_single_sample
+from qsm_tdv.data.contract import QSMSample, effective_data_weight, load_single_sample
 from qsm_tdv.evaluation.convergence import save_convergence_artifacts
 from qsm_tdv.models.tdv import TDVConfig, init_tdv_parameters, project_analysis_kernel
 from qsm_tdv.physics.dipole import dipole_kernel
 from qsm_tdv.physics.reconstruction import (
     ReconstructionConfig,
-    data_fidelity,
+    data_consistency,
     reconstruct,
     require_cg_residuals_within_tolerance,
 )
@@ -45,6 +45,7 @@ class OverfitConfig:
     log_every: int = 10
     supervised_metric: str = "mse"
     epoch_chunk_size: int = 2
+    include_magnitude_in_weight: bool = True
 
     def __post_init__(self) -> None:
         if self.iterations < 1 or self.log_every < 1 or self.epoch_chunk_size < 1:
@@ -63,7 +64,7 @@ class TrainingResult(NamedTuple):
     validation_mse: Array
     baseline_nrmse: Array
     validation_nrmse: Array
-    validation_data_fidelity: Array
+    validation_data_consistency: Array
     stopping_time: Array
     history: tuple[dict[str, float], ...]
 
@@ -94,14 +95,16 @@ def train_single_sample(
     batch = _single_sample_batch(sample)
     local_field = batch["local_field"]
     reference = batch["susceptibility"]
-    # The TDV-QSM protocol fixes chi_0 to zero.  Legacy datasets may still
-    # carry a chi_init array, but it is deliberately not used for training.
-    chi_init = jnp.zeros_like(local_field) if local_field is not None else None
     brain_mask = batch["brain_mask"]
-    if local_field is None or reference is None or chi_init is None or brain_mask is None:
+    if local_field is None or reference is None or brain_mask is None:
         raise RuntimeError("Validated QSMSample unexpectedly has a missing required array")
     reference_mask = batch["reference_mask"] if batch["reference_mask"] is not None else brain_mask
-    statistical_weight = batch["statistical_weight"]
+    data_weight = effective_data_weight(
+        brain_mask,
+        batch["magnitude"],
+        include_magnitude=overfit_config.include_magnitude_in_weight,
+    )
+    chi_init = data_weight * local_field
     kernel = dipole_kernel(
         tuple(local_field.shape[1:4]),
         sample.metadata.voxel_size_zyx,
@@ -130,27 +133,25 @@ def train_single_sample(
             tdv_config,
             reconstruction_config,
             regularizer_mask=brain_mask,
-            observation_mask=brain_mask,
-            statistical_weight=statistical_weight,
+            statistical_weight=data_weight,
         )
         terminal_mse = masked_mse(reconstruction, reference, reference_mask)
         terminal_nrmse = nrmse(reconstruction, reference, reference_mask)
-        field_energy = jnp.mean(
-            data_fidelity(
+        field_consistency = jnp.mean(
+            data_consistency(
                 reconstruction,
                 local_field,
                 kernel,
-                observation_mask=brain_mask,
-                statistical_weight=statistical_weight,
+                statistical_weight=data_weight,
             )
-        ) / jnp.maximum(jnp.sum(brain_mask), 1.0)
+        )
         supervised_error = terminal_mse if overfit_config.supervised_metric == "mse" else terminal_nrmse
-        loss = supervised_error + overfit_config.data_consistency_weight * field_energy
+        loss = supervised_error + overfit_config.data_consistency_weight * field_consistency
         metrics = {
             "loss": loss,
             "terminal_mse": terminal_mse,
             "terminal_nrmse": terminal_nrmse,
-            "data_fidelity": field_energy,
+            "data_consistency": field_consistency,
             "time": diagnostics.time,
             "tau": diagnostics.tau,
             "max_cg_relative_residual": jnp.max(diagnostics.relative_residuals),
@@ -244,8 +245,7 @@ def train_single_sample(
         tdv_config,
         reconstruction_config,
         regularizer_mask=brain_mask,
-        observation_mask=brain_mask,
-        statistical_weight=statistical_weight,
+        statistical_weight=data_weight,
     )
     require_cg_residuals_within_tolerance(diagnostics, reconstruction_config)
     return TrainingResult(
@@ -256,7 +256,7 @@ def train_single_sample(
         validation_mse=validation_metrics["terminal_mse"],
         baseline_nrmse=baseline_nrmse,
         validation_nrmse=validation_metrics["terminal_nrmse"],
-        validation_data_fidelity=validation_metrics["data_fidelity"],
+        validation_data_consistency=validation_metrics["data_consistency"],
         stopping_time=diagnostics.time,
         history=tuple(history),
     )
@@ -290,7 +290,7 @@ def save_training_result(
         "validation_mse": float(result.validation_mse),
         "baseline_nrmse": float(result.baseline_nrmse),
         "validation_nrmse": float(result.validation_nrmse),
-        "validation_data_fidelity": float(result.validation_data_fidelity),
+        "validation_data_consistency": float(result.validation_data_consistency),
         "stopping_time": float(result.stopping_time),
         "sample_manifest": sample.manifest,
         "tdv_config": asdict(tdv_config),
@@ -320,6 +320,12 @@ def main() -> None:
     parser.add_argument("--supervised-metric", choices=("mse", "nrmse"), default="mse")
     parser.add_argument("--epoch-chunk-size", type=int, default=2)
     parser.add_argument("--remat-force", action="store_true")
+    parser.add_argument(
+        "--include-magnitude-in-weight",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use W = brain_mask * magnitude when the sample provides magnitude (default: enabled)",
+    )
     arguments = parser.parse_args()
 
     sample = load_single_sample(arguments.dataset)
@@ -338,6 +344,7 @@ def main() -> None:
         log_every=arguments.log_every,
         supervised_metric=arguments.supervised_metric,
         epoch_chunk_size=arguments.epoch_chunk_size,
+        include_magnitude_in_weight=arguments.include_magnitude_in_weight,
     )
     result = train_single_sample(sample, tdv_config, reconstruction_config, overfit_config)
     save_training_result(result, sample, tdv_config, reconstruction_config, overfit_config, arguments.output_dir)

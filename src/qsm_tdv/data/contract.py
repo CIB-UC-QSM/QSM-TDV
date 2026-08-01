@@ -37,6 +37,7 @@ class QSMSample:
     manifest: dict[str, Any]
     reference_mask: np.ndarray | None = None
     statistical_weight: np.ndarray | None = None
+    magnitude: np.ndarray | None = None
 
     def as_batch(self) -> dict[str, jnp.ndarray | None]:
         """Convert the contract's unbatched arrays to float32 NDHWC tensors."""
@@ -47,13 +48,31 @@ class QSMSample:
         return {
             "local_field": batch(self.local_field),
             "susceptibility": batch(self.susceptibility),
-            # chi_0 is fixed by the reconstruction protocol.  Do not honour
-            # an adjoint initialisation stored in older .npz files.
-            "chi_init": batch(np.zeros_like(self.local_field)),
+            # The default protocol fixes chi_0 = W * b, with W including the
+            # mask and available magnitude. Do not honour older stored values.
+            "chi_init": batch(
+                effective_data_weight(self.brain_mask, self.magnitude, include_magnitude=True) * self.local_field
+            ),
             "brain_mask": batch(self.brain_mask),
             "reference_mask": batch(self.reference_mask),
             "statistical_weight": batch(self.statistical_weight),
+            "magnitude": batch(self.magnitude),
         }
+
+
+def effective_data_weight(
+    mask: np.ndarray | jnp.ndarray,
+    magnitude: np.ndarray | jnp.ndarray | None,
+    *,
+    include_magnitude: bool,
+) -> np.ndarray | jnp.ndarray:
+    """Form the explicit residual weight ``W = mask * magnitude`` when available."""
+
+    if include_magnitude and magnitude is not None:
+        if mask.shape != magnitude.shape:
+            raise ValueError("mask and magnitude must have the same shape")
+        return mask * magnitude
+    return mask
 
 
 def _validate_volume(name: str, value: np.ndarray, expected_spatial: tuple[int, int, int] | None = None) -> np.ndarray:
@@ -71,8 +90,9 @@ def load_single_sample(dataset_path: str | Path) -> QSMSample:
     """Load ``.npz`` plus its adjacent JSON manifest and validate all metadata.
 
     Required NPZ arrays are ``local_field``, ``susceptibility``, ``chi_init``,
-    and ``brain_mask``.  Optional arrays are ``reference_mask`` and
-    ``statistical_weight``.  The manifest shares the NPZ stem, e.g.
+    and ``brain_mask``.  Optional arrays are ``reference_mask``,
+    ``statistical_weight``, and ``magnitude``.  The manifest shares the NPZ
+    stem, e.g.
     ``sample.npz`` and ``sample.json``.
     """
 
@@ -114,10 +134,17 @@ def load_single_sample(dataset_path: str | Path) -> QSMSample:
             if "statistical_weight" in archive.files
             else None
         )
+        magnitude = (
+            _validate_volume("magnitude", archive["magnitude"], spatial_shape)
+            if "magnitude" in archive.files
+            else None
+        )
     if np.any(brain_mask < 0):
         raise ValueError("brain_mask must be non-negative")
     if statistical_weight is not None and np.any(statistical_weight < 0):
         raise ValueError("statistical_weight must be non-negative")
+    if magnitude is not None and np.any(magnitude < 0):
+        raise ValueError("magnitude must be non-negative")
     return QSMSample(
         local_field=local_field,
         susceptibility=susceptibility,
@@ -127,4 +154,5 @@ def load_single_sample(dataset_path: str | Path) -> QSMSample:
         manifest=manifest,
         reference_mask=reference_mask,
         statistical_weight=statistical_weight,
+        magnitude=magnitude,
     )

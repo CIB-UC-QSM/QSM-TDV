@@ -55,6 +55,9 @@ figures, `convergence.csv`, `convergence.png`, and masked NRMSE,
 The COSMOS runner saves its TDV parameters and Adam state in `checkpoint.pkl`.
 If a long full-volume run must be interrupted, continue it without resetting
 the fit, for example with `--resume --iterations 6 --total-epochs 100`.
+It uses `W = mask * magnitude` by default; pass
+`--no-include-magnitude-in-weight` to use `W = mask` instead. The same toggle
+is available in the generic single-sample training CLI.
 
 ## Evaluate a COSMOS-like input directory
 
@@ -81,9 +84,12 @@ conjugate-gradient updates used inside each one of those steps. Both override
 the saved checkpoint configuration for this evaluation only. Voxel size and
 B0 direction default to the checkpoint metadata; pass `--voxel-size VZ VY VX`
 and `--b0-direction BZ BY BX` to override them explicitly.
+When `magn.mat` (or `magnitude.mat`) is present, evaluation uses
+`W = mask * magnitude` by default; pass `--no-include-magnitude-in-weight` to
+use `W = mask`.
 
-The output directory contains `prediction.npy`, `chi_initial.npy` (the zero
-initial state),
+The output directory contains `prediction.npy`, `chi_initial.npy` (the weighted
+field initial state, \(\chi_0=W\cdot\mathrm{phase\_in}\)),
 `iteration_metrics.csv`, `report.json`, and `orthogonal_slices.png`. The CSV
 uses `nrmse_to_gt` for ‖\(\chi_s-\chi_{gt}\)‖/‖\(\chi_{gt}\)‖ when a
 reference exists. Its `tol_update_nrmse` is the requested convergence update:
@@ -140,10 +146,12 @@ For `S` steps and `tau = T/S`, the solver uses fixed-iteration CG to solve
 = \chi_s + \tau[A^Hb - \nabla_\chi R_\theta(\chi_s)].
 \]
 
-If a brain/observation mask or statistical weight map is supplied, it is
-represented explicitly as `W M` in the data term
-`0.5 || W M (A chi - b) ||²`; its exact adjoint is used in both the right-hand
-side and normal operator. It is never silently folded into `A`.
+Training and evaluation form one explicit data weight
+`W = brain_mask * magnitude` when magnitude is available, and fall back to
+`W = brain_mask` otherwise. The optional training/reporting data-consistency
+term is `|| W (A chi - b) ||₂`; the semi-implicit data energy is
+`0.5 || W (A chi - b) ||²` with its exact adjoint. The weight is never
+silently folded into `A`.
 
 After every Adam update the training loop functionally projects each output
 filter of the analysis kernel to zero mean. Differentiation remains connected
@@ -156,8 +164,8 @@ A sample is `sample.npz` with an adjacent `sample.json` manifest. See
 [the data contract](docs/data-contract.md). Arrays are unbatched `[Z,Y,X,1]`:
 
 - required: `local_field`, `susceptibility`, `chi_init` (legacy compatibility;
-  emitted as zeros), `brain_mask`;
-- optional: `reference_mask`, `statistical_weight`.
+  canonically emitted as `W * local_field`), `brain_mask`;
+- optional: `reference_mask`, `magnitude`, `statistical_weight`.
 
 The manifest makes source, processing version, anonymised subject ID, units,
 reference convention, voxel size, and B0 direction explicit. The synthetic
