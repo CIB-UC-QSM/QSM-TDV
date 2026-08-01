@@ -1,0 +1,29 @@
+{
+  "cosmos_data": "/cosmos_data",
+  "simulation": {
+    "snr": 70.0,
+    "seed": 0,
+    "voxel_size_zyx": [1.0, 1.0, 1.0],
+    "b0_direction_zyx": [0.0, 0.0, 1.0],
+    "phase_scale_radians_per_susceptibility_unit": 1.0
+  },
+  "tdv": {
+    "features": 1,
+    "macro_blocks": 1,
+    "kernel_size": 3,
+    "nu": 0.1
+  },
+  "reconstruction": {
+    "steps": 1,
+    "cg_iterations": 12,
+    "max_time": 0.25,
+    "remat_force": true
+  },
+  "optimization": {
+    "supervised_metric": "nrmse",
+    "iterations": 100,
+    "epoch_chunk_size": 2,
+    "learning_rate": 0.001,
+    "seed": 0
+  }
+}

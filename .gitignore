@@ -157,6 +157,10 @@ ENV/
 env.bak/
 venv.bak/
 
+# Local source data and generated experiment artefacts
+cosmos_data/
+runs/
+
 # Spyder project settings
 .spyderproject
 .spyproject

@@ -1,0 +1,33 @@
+[project]
+name = "qsm-tdv"
+version = "0.1.0"
+description = "Energy-based Total Deep Variation for 3D quantitative susceptibility mapping"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "jax>=0.6.0",
+    "matplotlib>=3.9",
+    "numpy>=2.0",
+    "scipy>=1.15",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+qsm-tdv-generate-synthetic = "qsm_tdv.data.synthetic:main"
+qsm-tdv-generate-cosmos = "qsm_tdv.data.cosmos:main"
+qsm-tdv-overfit = "qsm_tdv.training.overfit:main"
+qsm-tdv-validate = "qsm_tdv.training.validate:main"
+qsm-tdv-evaluate = "qsm_tdv.evaluation.input_set:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

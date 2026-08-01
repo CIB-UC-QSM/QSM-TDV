@@ -1,0 +1,21 @@
+{
+  "dataset": "data/synthetic/synthetic_0001.npz",
+  "tdv": {
+    "features": 4,
+    "macro_blocks": 1,
+    "kernel_size": 3,
+    "nu": 0.1
+  },
+  "reconstruction": {
+    "steps": 2,
+    "cg_iterations": 12,
+    "max_time": 0.25
+  },
+  "optimization": {
+    "iterations": 100,
+    "learning_rate": 0.001,
+    "data_consistency_weight": 0.0,
+    "seed": 0
+  },
+  "validation_mode": "same_sample_overfit_diagnostic"
+}
