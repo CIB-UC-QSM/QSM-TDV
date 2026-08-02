@@ -59,3 +59,25 @@ def global_norm(tree: PyTree) -> Array:
 
     squared = [jnp.sum(jnp.square(leaf)) for leaf in jax.tree.leaves(tree)]
     return jnp.sqrt(jnp.sum(jnp.stack(squared)))
+
+
+def clip_by_global_norm(
+    gradients: PyTree,
+    max_norm: float,
+    *,
+    epsilon: float = 1e-12,
+) -> tuple[PyTree, Array, Array]:
+    """Clip a gradient pytree to a maximum global Euclidean norm.
+
+    The returned norm is measured before clipping and the scale is one when no
+    clipping is needed.  This is purely functional, so it is safe inside a
+    jitted training step and ensures Adam's moments see the clipped gradients.
+    """
+
+    if max_norm <= 0:
+        raise ValueError("max_norm must be positive")
+    if epsilon <= 0:
+        raise ValueError("epsilon must be positive")
+    gradient_norm = global_norm(gradients)
+    clip_scale = jnp.minimum(1.0, jnp.asarray(max_norm, dtype=gradient_norm.dtype) / (gradient_norm + epsilon))
+    return jax.tree.map(lambda gradient: gradient * clip_scale, gradients), gradient_norm, clip_scale

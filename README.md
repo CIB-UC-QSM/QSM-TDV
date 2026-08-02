@@ -59,6 +59,22 @@ It uses `W = mask * magnitude` by default; pass
 `--no-include-magnitude-in-weight` to use `W = mask` instead. The same toggle
 is available in the generic single-sample training CLI.
 
+To compare multi-step stability without mixing checkpoints or optimizer
+states, run the supplied sequential (S=1,2,3) sweep. It uses the same seed
+and hyperparameters for all three fresh runs, writes to separate directories,
+and refuses to overwrite an existing result:
+
+```bash
+scripts/run_cosmos_step_sweep.sh \
+  --cosmos-data /cosmos_data \
+  --output-root runs/cosmos-step-sweep \
+  --iterations 100 --features 1 --cg-iterations 12
+```
+
+Use `scripts/run_cosmos_step_sweep.sh --help` to set all shared experiment
+parameters. The script deliberately does not use `--resume`, since changing
+(S) changes the training objective.
+
 ## Evaluate a COSMOS-like input directory
 
 Evaluate a trained checkpoint on any directory containing `msk.mat` and either
@@ -152,6 +168,10 @@ Training and evaluation form one explicit data weight
 term is `|| W (A chi - b) ||₂`; the semi-implicit data energy is
 `0.5 || W (A chi - b) ||²` with its exact adjoint. The weight is never
 silently folded into `A`.
+
+Before each Adam update, training clips the global parameter-gradient norm to
+`1.0`. The threshold is recorded in the run report and can be changed
+explicitly with `--max-gradient-norm` for controlled experiments.
 
 After every Adam update the training loop functionally projects each output
 filter of the analysis kernel to zero mean. Differentiation remains connected

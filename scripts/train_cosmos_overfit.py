@@ -31,6 +31,12 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--total-epochs", type=int, default=100, help="Total target used in progress output when resuming")
     parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument(
+        "--max-gradient-norm",
+        type=float,
+        default=1.0,
+        help="Global gradient-norm clipping threshold applied before Adam (default: 1.0)",
+    )
     parser.add_argument("--data-consistency-weight", type=float, default=0.0)
     parser.add_argument("--features", type=int, default=1)
     parser.add_argument("--macro-blocks", type=int, default=1)
@@ -98,6 +104,7 @@ def main() -> None:
     overfit_config = OverfitConfig(
         iterations=arguments.iterations,
         learning_rate=arguments.learning_rate,
+        max_gradient_norm=arguments.max_gradient_norm,
         data_consistency_weight=arguments.data_consistency_weight,
         seed=arguments.seed,
         log_every=arguments.log_every,

@@ -28,9 +28,12 @@ def test_tiny_synthetic_sample_overfits_with_finite_time_and_zero_mean_kernel(tm
         "macro_blocks_gradient_norm",
         "readout_gradient_norm",
         "raw_time_gradient",
+        "gradient_clip_scale",
+        "clipped_gradient_norm",
     ):
         assert jnp.isfinite(metrics[name])
         assert abs(metrics[name]) > 0.0
+    assert metrics["clipped_gradient_norm"] <= 1.0 + 1e-6
 
 
 def test_nrmse_matches_its_documented_l2_definition():

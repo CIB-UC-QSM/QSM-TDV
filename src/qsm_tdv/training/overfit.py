@@ -30,7 +30,7 @@ from qsm_tdv.physics.reconstruction import (
     reconstruct,
     require_cg_residuals_within_tolerance,
 )
-from qsm_tdv.training.adam import AdamState, adam_init, adam_update, global_norm
+from qsm_tdv.training.adam import AdamState, adam_init, adam_update, clip_by_global_norm, global_norm
 from qsm_tdv.training.metrics import masked_mse, nrmse
 
 Array = jax.Array
@@ -40,6 +40,7 @@ Array = jax.Array
 class OverfitConfig:
     iterations: int = 100
     learning_rate: float = 1e-3
+    max_gradient_norm: float = 1.0
     data_consistency_weight: float = 0.0
     seed: int = 0
     log_every: int = 10
@@ -50,8 +51,10 @@ class OverfitConfig:
     def __post_init__(self) -> None:
         if self.iterations < 1 or self.log_every < 1 or self.epoch_chunk_size < 1:
             raise ValueError("iterations, log_every, and epoch_chunk_size must be positive")
-        if self.learning_rate <= 0 or self.data_consistency_weight < 0:
-            raise ValueError("learning_rate must be positive and data consistency weight non-negative")
+        if self.learning_rate <= 0 or self.max_gradient_norm <= 0 or self.data_consistency_weight < 0:
+            raise ValueError(
+                "learning_rate and max_gradient_norm must be positive and data consistency weight non-negative"
+            )
         if self.supervised_metric not in {"mse", "nrmse"}:
             raise ValueError("supervised_metric must be either 'mse' or 'nrmse'")
 
@@ -161,9 +164,13 @@ def train_single_sample(
 
     def train_step(parameters: dict[str, Any], state: AdamState) -> tuple[dict[str, Any], AdamState, dict[str, Array]]:
         (loss, metrics), gradients = jax.value_and_grad(objective, has_aux=True)(parameters)
+        clipped_gradients, gradient_norm, clip_scale = clip_by_global_norm(
+            gradients,
+            overfit_config.max_gradient_norm,
+        )
         updated_parameters, updated_state = adam_update(
             parameters,
-            gradients,
+            clipped_gradients,
             state,
             learning_rate=overfit_config.learning_rate,
         )
@@ -173,7 +180,9 @@ def train_single_sample(
         }
         metrics = {
             **metrics,
-            "gradient_norm": global_norm(gradients),
+            "gradient_norm": gradient_norm,
+            "clipped_gradient_norm": global_norm(clipped_gradients),
+            "gradient_clip_scale": clip_scale,
             "analysis_gradient_norm": global_norm(gradients["tdv"]["analysis_kernel"]),
             "macro_blocks_gradient_norm": global_norm(gradients["tdv"]["macro_blocks"]),
             "readout_gradient_norm": global_norm(gradients["tdv"]["readout_kernel"]),
@@ -309,6 +318,12 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, default=Path("runs/overfit"))
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument(
+        "--max-gradient-norm",
+        type=float,
+        default=1.0,
+        help="Global gradient-norm clipping threshold applied before Adam (default: 1.0)",
+    )
     parser.add_argument("--data-consistency-weight", type=float, default=0.0)
     parser.add_argument("--features", type=int, default=4)
     parser.add_argument("--macro-blocks", type=int, default=1)
@@ -339,6 +354,7 @@ def main() -> None:
     overfit_config = OverfitConfig(
         iterations=arguments.iterations,
         learning_rate=arguments.learning_rate,
+        max_gradient_norm=arguments.max_gradient_norm,
         data_consistency_weight=arguments.data_consistency_weight,
         seed=arguments.seed,
         log_every=arguments.log_every,
