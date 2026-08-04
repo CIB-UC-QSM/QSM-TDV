@@ -45,13 +45,23 @@ def test_semi_implicit_equation_residual_is_small():
     )
     params = init_tdv_parameters(key_params, tdv_config)
     chi = jax.random.normal(key_chi, (1, *shape, 1)) * 0.01
+    regularizer_mask = jnp.zeros_like(chi).at[:, :6, :, :, :].set(1.0)
     kernel = dipole_kernel(shape, (0.8, 1.1, 1.4), (0.1, 0.4, 0.9))
     local_field = apply_dipole(chi, kernel)
     tau = jnp.asarray(0.03, dtype=jnp.float32)
     next_chi, diagnostics = semi_implicit_step(
-        params, chi, local_field, kernel, tdv_config, reconstruction_config, tau
+        params,
+        chi,
+        local_field,
+        kernel,
+        tdv_config,
+        reconstruction_config,
+        tau,
+        regularizer_mask=regularizer_mask,
     )
-    rhs = chi + tau * (data_rhs(local_field, kernel) - tdv_force(params, chi, tdv_config))
+    rhs = chi + tau * (
+        data_rhs(local_field, kernel) - tdv_force(params, chi, tdv_config, regularizer_mask)
+    )
     residual = next_chi + tau * data_normal(next_chi, kernel) - rhs
     relative = jnp.linalg.norm(residual) / (jnp.linalg.norm(rhs) + 1e-8)
     assert float(relative) < 2e-5

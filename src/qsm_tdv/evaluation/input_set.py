@@ -171,6 +171,21 @@ def _nrmse(estimate: np.ndarray, ground_truth: np.ndarray, mask: np.ndarray) -> 
     return float(np.linalg.norm(difference.reshape(-1)) / max(float(np.linalg.norm(target.reshape(-1))), 1e-12))
 
 
+def _rmse(estimate: np.ndarray, ground_truth: np.ndarray, mask: np.ndarray) -> float:
+    """Masked root-mean-square error on the explicit brain support."""
+
+    support = mask > 0
+    if not np.any(support):
+        raise ValueError("Cannot compute RMSE with an empty brain mask")
+    return float(np.sqrt(np.mean((estimate[support] - ground_truth[support]) ** 2)))
+
+
+def _tol_update(current: np.ndarray, previous: np.ndarray) -> float:
+    """Return ``||x_now - x_prev||_2 / ||x_prev||_2`` for successive states."""
+
+    return float(np.linalg.norm((current - previous).reshape(-1)) / max(np.linalg.norm(previous.reshape(-1)), 1e-12))
+
+
 def _read_checkpoint(path: Path) -> dict[str, Any]:
     """Read a local training checkpoint after validating required members."""
 
@@ -205,7 +220,15 @@ def _metadata_vector(
 
 
 def _write_rows(path: Path, rows: list[dict[str, float | int | None]]) -> None:
-    fields = ("iteration", "nrmse_to_gt", "tol_update_nrmse", "cg_relative_residual", "tdv_energy")
+    fields = (
+        "iteration",
+        "rmse_to_gt",
+        "nrmse_to_gt",
+        "tol_update",
+        "tol_update_nrmse",
+        "cg_relative_residual",
+        "tdv_energy",
+    )
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
@@ -272,14 +295,18 @@ def evaluate_checkpoint(
     for iteration, state in enumerate(trajectory_np):
         row: dict[str, float | int | None] = {
             "iteration": iteration,
+            "tol_update": None,
+            "rmse_to_gt": None,
             "nrmse_to_gt": None,
             "tol_update_nrmse": None,
             "cg_relative_residual": None,
             "tdv_energy": None,
         }
         if sample.susceptibility is not None:
+            row["rmse_to_gt"] = _rmse(state[0, ..., 0], sample.susceptibility, sample.brain_mask)
             row["nrmse_to_gt"] = _nrmse(state[0, ..., 0], sample.susceptibility, sample.brain_mask)
         if iteration > 0:
+            row["tol_update"] = _tol_update(state[0, ..., 0], trajectory_np[iteration - 1, 0, ..., 0])
             row["tol_update_nrmse"] = _nrmse(
                 state[0, ..., 0], trajectory_np[iteration - 1, 0, ..., 0], sample.brain_mask
             )
@@ -322,7 +349,11 @@ def evaluate_checkpoint(
         "max_cg_relative_residual": max_residual,
         "cg_relative_tolerance": reconstruction_config.cg_relative_tolerance,
         "cg_tolerance_met": max_residual <= reconstruction_config.cg_relative_tolerance,
+        "rmse_definition": "masked sqrt(mean((chi_s - chi_gt)^2)) over brain_mask > 0",
+        "tol_update_definition": "||x_now - x_prev||_2 / ||x_prev||_2 over the full reconstruction state",
+        "final_rmse_to_gt": rows[-1]["rmse_to_gt"],
         "final_nrmse_to_gt": final_nrmse,
+        "final_tol_update": rows[-1]["tol_update"],
         "final_tol_update_nrmse": rows[-1]["tol_update_nrmse"],
         "iteration_metrics": str(destination / "iteration_metrics.csv"),
         "slice_figure": str(figure),

@@ -30,7 +30,15 @@ from qsm_tdv.physics.reconstruction import (
     reconstruct,
     require_cg_residuals_within_tolerance,
 )
-from qsm_tdv.training.adam import AdamState, adam_init, adam_update, clip_by_global_norm, global_norm
+from qsm_tdv.training.adam import (
+    AdamState,
+    all_finite,
+    adam_init,
+    adam_update,
+    clip_by_global_norm,
+    clip_parameter_update,
+    global_norm,
+)
 from qsm_tdv.training.metrics import masked_mse, nrmse
 
 Array = jax.Array
@@ -41,6 +49,12 @@ class OverfitConfig:
     iterations: int = 100
     learning_rate: float = 1e-3
     max_gradient_norm: float = 1.0
+    max_parameter_update_norm: float | None = None
+    max_candidate_force_norm: float | None = None
+    max_candidate_loss_ratio: float | None = None
+    max_update_backtracks: int = 0
+    max_consecutive_rejections: int | None = None
+    restore_best_parameters: bool = False
     data_consistency_weight: float = 0.0
     seed: int = 0
     log_every: int = 10
@@ -55,6 +69,16 @@ class OverfitConfig:
             raise ValueError(
                 "learning_rate and max_gradient_norm must be positive and data consistency weight non-negative"
             )
+        if self.max_parameter_update_norm is not None and self.max_parameter_update_norm <= 0:
+            raise ValueError("max_parameter_update_norm must be positive when supplied")
+        if self.max_candidate_force_norm is not None and self.max_candidate_force_norm <= 0:
+            raise ValueError("max_candidate_force_norm must be positive when supplied")
+        if self.max_candidate_loss_ratio is not None and self.max_candidate_loss_ratio < 1:
+            raise ValueError("max_candidate_loss_ratio must be at least one when supplied")
+        if self.max_update_backtracks < 0:
+            raise ValueError("max_update_backtracks must be non-negative")
+        if self.max_consecutive_rejections is not None and self.max_consecutive_rejections < 1:
+            raise ValueError("max_consecutive_rejections must be positive when supplied")
         if self.supervised_metric not in {"mse", "nrmse"}:
             raise ValueError("supervised_metric must be either 'mse' or 'nrmse'")
 
@@ -69,6 +93,9 @@ class TrainingResult(NamedTuple):
     validation_nrmse: Array
     validation_data_consistency: Array
     stopping_time: Array
+    best_iteration: int
+    training_iterations_completed: int
+    stopped_early: bool
     history: tuple[dict[str, float], ...]
 
 
@@ -162,89 +189,344 @@ def train_single_sample(
         }
         return loss, metrics
 
+    def candidate_is_safe(
+        current_loss: Array, candidate_parameters: dict[str, Any]
+    ) -> tuple[Array, dict[str, Array]]:
+        """Evaluate a post-update rollout without changing TDV dynamics.
+
+        The candidate force remains the autodiff gradient of the scalar TDV
+        energy. Unsafe *parameter updates* are rejected before becoming the
+        next training state; the force itself is never clipped or detached.
+        """
+
+        candidate_loss, candidate_metrics = objective(candidate_parameters)
+        accepted = all_finite(candidate_parameters) & all_finite(candidate_metrics)
+        if overfit_config.max_candidate_force_norm is not None:
+            accepted = accepted & (
+                candidate_metrics["max_force_norm"]
+                <= jnp.asarray(overfit_config.max_candidate_force_norm, dtype=candidate_loss.dtype)
+            )
+        if overfit_config.max_candidate_loss_ratio is not None:
+            accepted = accepted & (
+                candidate_loss
+                <= current_loss * jnp.asarray(overfit_config.max_candidate_loss_ratio, dtype=current_loss.dtype)
+            )
+        return accepted, candidate_metrics
+
     def train_step(parameters: dict[str, Any], state: AdamState) -> tuple[dict[str, Any], AdamState, dict[str, Array]]:
         (loss, metrics), gradients = jax.value_and_grad(objective, has_aux=True)(parameters)
         clipped_gradients, gradient_norm, clip_scale = clip_by_global_norm(
             gradients,
             overfit_config.max_gradient_norm,
         )
-        updated_parameters, updated_state = adam_update(
+        proposed_parameters, updated_state = adam_update(
             parameters,
             clipped_gradients,
             state,
             learning_rate=overfit_config.learning_rate,
         )
+        updated_parameters, parameter_update_norm, parameter_update_scale = clip_parameter_update(
+            parameters,
+            proposed_parameters,
+            overfit_config.max_parameter_update_norm,
+        )
         updated_parameters = {
             **updated_parameters,
             "tdv": project_analysis_kernel(updated_parameters["tdv"]),
         }
+
+        candidate_checks_enabled = (
+            overfit_config.max_candidate_force_norm is not None
+            or overfit_config.max_candidate_loss_ratio is not None
+            or overfit_config.max_update_backtracks > 0
+        )
+        if candidate_checks_enabled:
+            update_accepted, candidate_metrics = candidate_is_safe(loss, updated_parameters)
+            selected_parameters = updated_parameters
+            selected_metrics = candidate_metrics
+            selected_backtrack_scale = jnp.asarray(1.0, dtype=loss.dtype)
+            for backtrack in range(overfit_config.max_update_backtracks):
+                fraction = 0.5 ** (backtrack + 1)
+
+                def keep_selected(_: None):
+                    return (
+                        selected_parameters,
+                        selected_metrics,
+                        update_accepted,
+                        selected_backtrack_scale,
+                    )
+
+                def try_backtrack(_: None):
+                    trial_parameters = jax.tree.map(
+                        lambda current, candidate: current + fraction * (candidate - current),
+                        parameters,
+                        updated_parameters,
+                    )
+                    trial_accepted, trial_metrics = candidate_is_safe(loss, trial_parameters)
+                    return (
+                        trial_parameters,
+                        trial_metrics,
+                        trial_accepted,
+                        jnp.asarray(fraction, dtype=loss.dtype),
+                    )
+
+                (
+                    selected_parameters,
+                    selected_metrics,
+                    update_accepted,
+                    selected_backtrack_scale,
+                ) = jax.lax.cond(update_accepted, keep_selected, try_backtrack, operand=None)
+            next_parameters = jax.tree.map(
+                lambda candidate, current: jnp.where(update_accepted, candidate, current),
+                selected_parameters,
+                parameters,
+            )
+            next_state = jax.tree.map(
+                lambda candidate, current: jnp.where(update_accepted, candidate, current),
+                updated_state,
+                state,
+            )
+        else:
+            next_parameters = updated_parameters
+            next_state = updated_state
+            update_accepted = jnp.asarray(True)
+            selected_metrics = metrics
+            selected_backtrack_scale = jnp.asarray(1.0, dtype=loss.dtype)
+
         metrics = {
             **metrics,
             "gradient_norm": gradient_norm,
             "clipped_gradient_norm": global_norm(clipped_gradients),
             "gradient_clip_scale": clip_scale,
+            "parameter_update_norm": parameter_update_norm,
+            "parameter_update_scale": parameter_update_scale,
+            "candidate_loss": selected_metrics["loss"],
+            "candidate_max_force_norm": selected_metrics["max_force_norm"],
+            "candidate_max_cg_relative_residual": selected_metrics["max_cg_relative_residual"],
+            "update_accepted": update_accepted.astype(jnp.float32),
+            "update_backtrack_scale": selected_backtrack_scale,
             "analysis_gradient_norm": global_norm(gradients["tdv"]["analysis_kernel"]),
             "macro_blocks_gradient_norm": global_norm(gradients["tdv"]["macro_blocks"]),
             "readout_gradient_norm": global_norm(gradients["tdv"]["readout_kernel"]),
             "raw_time_gradient": gradients["raw_time"],
             "loss": loss,
         }
-        return updated_parameters, updated_state, metrics
+        return next_parameters, next_state, metrics
 
     evaluate = jax.jit(objective)
 
+    def select_tree(condition: Array, accepted: Any, rejected: Any) -> Any:
+        return jax.tree.map(lambda yes, no: jnp.where(condition, yes, no), accepted, rejected)
+
     def build_train_chunk(
         chunk_length: int,
-        parameters: dict[str, Any], state: AdamState
-    ) -> tuple[dict[str, Any], AdamState, dict[str, Array]]:
-        """Build a static, bounded scan of full-volume updates."""
+        parameters: dict[str, Any],
+        state: AdamState,
+        best_parameters: dict[str, Any],
+        best_state: AdamState,
+        best_loss: Array,
+        best_iteration: Array,
+        first_iteration: Array,
+    ) -> tuple[
+        dict[str, Any], AdamState, dict[str, Any], AdamState, Array, Array, dict[str, Array]
+    ]:
+        """Build a static, bounded scan while retaining the best committed state."""
 
         def one_update(
-            carry: tuple[dict[str, Any], AdamState], _: None
-        ) -> tuple[tuple[dict[str, Any], AdamState], dict[str, Array]]:
-            current_parameters, current_state = carry
+            carry: tuple[
+                dict[str, Any], AdamState, dict[str, Any], AdamState, Array, Array, Array
+            ],
+            _: None,
+        ) -> tuple[
+            tuple[dict[str, Any], AdamState, dict[str, Any], AdamState, Array, Array, Array],
+            dict[str, Array],
+        ]:
+            (
+                current_parameters,
+                current_state,
+                current_best_parameters,
+                current_best_state,
+                current_best_loss,
+                current_best_iteration,
+                current_iteration,
+            ) = carry
             next_parameters, next_state, metrics = train_step(current_parameters, current_state)
-            return (next_parameters, next_state), metrics
+            is_best = (
+                all_finite(current_parameters)
+                & jnp.isfinite(metrics["loss"])
+                & (metrics["loss"] < current_best_loss)
+            )
+            next_best_parameters = select_tree(is_best, current_parameters, current_best_parameters)
+            next_best_state = select_tree(is_best, current_state, current_best_state)
+            next_best_loss = jnp.where(is_best, metrics["loss"], current_best_loss)
+            next_best_iteration = jnp.where(is_best, current_iteration, current_best_iteration)
+            return (
+                (
+                    next_parameters,
+                    next_state,
+                    next_best_parameters,
+                    next_best_state,
+                    next_best_loss,
+                    next_best_iteration,
+                    current_iteration + jnp.asarray(1, dtype=current_iteration.dtype),
+                ),
+                metrics,
+            )
 
-        (final_parameters, final_state), metric_history = jax.lax.scan(
+        (
+            (
+                final_parameters,
+                final_state,
+                final_best_parameters,
+                final_best_state,
+                final_best_loss,
+                final_best_iteration,
+                _,
+            ),
+            metric_history,
+        ) = jax.lax.scan(
             one_update,
-            (parameters, state),
+            (
+                parameters,
+                state,
+                best_parameters,
+                best_state,
+                best_loss,
+                best_iteration,
+                first_iteration,
+            ),
             xs=None,
             length=chunk_length,
         )
-        return final_parameters, final_state, metric_history
+        return (
+            final_parameters,
+            final_state,
+            final_best_parameters,
+            final_best_state,
+            final_best_loss,
+            final_best_iteration,
+            metric_history,
+        )
 
     baseline_metrics = evaluate(initial_parameters)[1]
     baseline_mse = baseline_metrics["terminal_mse"]
     baseline_nrmse = baseline_metrics["terminal_nrmse"]
     parameters = initial_parameters
+    best_parameters = initial_parameters
+    best_optimizer_state = optimizer_state
+    best_loss = baseline_metrics["loss"]
+    best_iteration = jnp.asarray(epoch_offset, dtype=jnp.int32)
     history: list[dict[str, float]] = []
     chunk_runners: dict[int, Any] = {}
+    rejection_streak = 0
+    training_iterations_completed = 0
+    stopped_early = False
+    def make_chunk_runner(chunk_length: int) -> Any:
+        def run_chunk(
+            current_parameters: dict[str, Any],
+            current_state: AdamState,
+            current_best_parameters: dict[str, Any],
+            current_best_state: AdamState,
+            current_best_loss: Array,
+            current_best_iteration: Array,
+            first_iteration: Array,
+        ) -> tuple[dict[str, Any], AdamState, dict[str, Any], AdamState, Array, Array, dict[str, Array]]:
+            return build_train_chunk(
+                chunk_length,
+                current_parameters,
+                current_state,
+                current_best_parameters,
+                current_best_state,
+                current_best_loss,
+                current_best_iteration,
+                first_iteration,
+            )
+
+        return jax.jit(run_chunk)
+
     for first_epoch in range(0, overfit_config.iterations, overfit_config.epoch_chunk_size):
         chunk_length = min(overfit_config.epoch_chunk_size, overfit_config.iterations - first_epoch)
         if chunk_length not in chunk_runners:
-            chunk_runners[chunk_length] = jax.jit(
-                lambda current_parameters, current_state, length=chunk_length: build_train_chunk(
-                    length, current_parameters, current_state
-                ),
-                donate_argnums=(0, 1),
-            )
-        parameters, optimizer_state, chunk_metrics = chunk_runners[chunk_length](parameters, optimizer_state)
+            chunk_runners[chunk_length] = make_chunk_runner(chunk_length)
+        (
+            parameters,
+            optimizer_state,
+            best_parameters,
+            best_optimizer_state,
+            best_loss,
+            best_iteration,
+            chunk_metrics,
+        ) = chunk_runners[chunk_length](
+            parameters,
+            optimizer_state,
+            best_parameters,
+            best_optimizer_state,
+            best_loss,
+            best_iteration,
+            jnp.asarray(epoch_offset + first_epoch + 1, dtype=jnp.int32),
+        )
         # Synchronizing once per bounded chunk prevents a full-volume
         # higher-order buffer queue from accumulating on accelerator backends.
-        parameters, optimizer_state, chunk_metrics = jax.block_until_ready(
-            (parameters, optimizer_state, chunk_metrics)
+        (
+            parameters,
+            optimizer_state,
+            best_parameters,
+            best_optimizer_state,
+            best_loss,
+            best_iteration,
+            chunk_metrics,
+        ) = jax.block_until_ready(
+            (
+                parameters,
+                optimizer_state,
+                best_parameters,
+                best_optimizer_state,
+                best_loss,
+                best_iteration,
+                chunk_metrics,
+            )
         )
         for local_epoch in range(chunk_length):
             iteration = epoch_offset + first_epoch + local_epoch + 1
+            training_iterations_completed += 1
+            if float(chunk_metrics["update_accepted"][local_epoch]) >= 0.5:
+                rejection_streak = 0
+            else:
+                rejection_streak += 1
             if iteration == 1 or iteration % overfit_config.log_every == 0 or iteration == overfit_config.iterations:
                 report = {"iteration": float(iteration)}
                 report.update({name: float(value[local_epoch]) for name, value in chunk_metrics.items()})
+                report["consecutive_rejections"] = float(rejection_streak)
                 history.append(report)
                 if progress_callback is not None:
                     progress_callback(report)
+            if (
+                overfit_config.max_consecutive_rejections is not None
+                and rejection_streak >= overfit_config.max_consecutive_rejections
+            ):
+                stopped_early = True
+                break
+        if stopped_early:
+            break
 
-    (_, validation_metrics) = evaluate(parameters)
+    _, final_metrics = evaluate(parameters)
+    final_is_best = bool(
+        jax.device_get(
+            all_finite(parameters)
+            & jnp.isfinite(final_metrics["loss"])
+            & (final_metrics["loss"] < best_loss)
+        )
+    )
+    if final_is_best:
+        best_parameters = parameters
+        best_optimizer_state = optimizer_state
+        best_loss = final_metrics["loss"]
+        best_iteration = jnp.asarray(epoch_offset + training_iterations_completed, dtype=jnp.int32)
+
+    if overfit_config.restore_best_parameters:
+        parameters = best_parameters
+        optimizer_state = best_optimizer_state
+    _, validation_metrics = evaluate(parameters)
     reconstruction, diagnostics = reconstruct(
         parameters["tdv"],
         parameters["raw_time"],
@@ -267,6 +549,9 @@ def train_single_sample(
         validation_nrmse=validation_metrics["terminal_nrmse"],
         validation_data_consistency=validation_metrics["data_consistency"],
         stopping_time=diagnostics.time,
+        best_iteration=int(jax.device_get(best_iteration)),
+        training_iterations_completed=training_iterations_completed,
+        stopped_early=stopped_early,
         history=tuple(history),
     )
 
@@ -301,6 +586,9 @@ def save_training_result(
         "validation_nrmse": float(result.validation_nrmse),
         "validation_data_consistency": float(result.validation_data_consistency),
         "stopping_time": float(result.stopping_time),
+        "best_iteration": result.best_iteration,
+        "training_iterations_completed": result.training_iterations_completed,
+        "stopped_early": result.stopped_early,
         "sample_manifest": sample.manifest,
         "tdv_config": asdict(tdv_config),
         "reconstruction_config": asdict(reconstruction_config),
@@ -324,12 +612,54 @@ def main() -> None:
         default=1.0,
         help="Global gradient-norm clipping threshold applied before Adam (default: 1.0)",
     )
+    parser.add_argument(
+        "--max-parameter-update-norm",
+        type=float,
+        default=None,
+        help="Optional global trust-region bound for each post-Adam parameter update",
+    )
+    parser.add_argument(
+        "--max-candidate-force-norm",
+        type=float,
+        default=None,
+        help="Reject post-update rollouts whose energy-derived TDV force exceeds this norm",
+    )
+    parser.add_argument(
+        "--max-candidate-loss-ratio",
+        type=float,
+        default=None,
+        help="Reject post-update rollouts whose loss exceeds this multiple of the current loss",
+    )
+    parser.add_argument(
+        "--max-update-backtracks",
+        type=int,
+        default=0,
+        help="Halving attempts for a rejected Adam update before rollback",
+    )
+    parser.add_argument(
+        "--max-consecutive-rejections",
+        type=int,
+        default=None,
+        help="Optional early stop after this many consecutive rejected updates",
+    )
+    parser.add_argument(
+        "--restore-best-parameters",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Return the lowest-loss finite state observed during training",
+    )
     parser.add_argument("--data-consistency-weight", type=float, default=0.0)
     parser.add_argument("--features", type=int, default=4)
     parser.add_argument("--macro-blocks", type=int, default=1)
     parser.add_argument("--steps", type=int, default=2)
     parser.add_argument("--cg-iterations", type=int, default=6)
     parser.add_argument("--max-time", type=float, default=0.25)
+    parser.add_argument(
+        "--regularizer-weight",
+        type=float,
+        default=1.0,
+        help="Positive scalar multiplying the TDV scalar energy and its gradient",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--supervised-metric", choices=("mse", "nrmse"), default="mse")
@@ -350,11 +680,18 @@ def main() -> None:
         cg_iterations=arguments.cg_iterations,
         max_time=arguments.max_time,
         remat_force=arguments.remat_force,
+        regularizer_weight=arguments.regularizer_weight,
     )
     overfit_config = OverfitConfig(
         iterations=arguments.iterations,
         learning_rate=arguments.learning_rate,
         max_gradient_norm=arguments.max_gradient_norm,
+        max_parameter_update_norm=arguments.max_parameter_update_norm,
+        max_candidate_force_norm=arguments.max_candidate_force_norm,
+        max_candidate_loss_ratio=arguments.max_candidate_loss_ratio,
+        max_update_backtracks=arguments.max_update_backtracks,
+        max_consecutive_rejections=arguments.max_consecutive_rejections,
+        restore_best_parameters=arguments.restore_best_parameters,
         data_consistency_weight=arguments.data_consistency_weight,
         seed=arguments.seed,
         log_every=arguments.log_every,

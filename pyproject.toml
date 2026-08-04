@@ -5,7 +5,7 @@ description = "Energy-based Total Deep Variation for 3D quantitative susceptibil
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "jax>=0.6.0",
+    "jax[cuda13]>=0.6.0",
     "matplotlib>=3.9",
     "numpy>=2.0",
     "scipy>=1.15",

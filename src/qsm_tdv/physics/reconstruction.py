@@ -25,12 +25,15 @@ class ReconstructionConfig:
     cg_epsilon: float = 1e-12
     cg_relative_tolerance: float = 1e-4
     remat_force: bool = False
+    regularizer_weight: float = 1.0
 
     def __post_init__(self) -> None:
         if self.steps < 1 or self.cg_iterations < 1:
             raise ValueError("steps and cg_iterations must be positive")
         if self.max_time <= 0 or self.cg_epsilon <= 0 or self.cg_relative_tolerance <= 0:
             raise ValueError("max_time, cg_epsilon, and cg_relative_tolerance must be positive")
+        if self.regularizer_weight <= 0:
+            raise ValueError("regularizer_weight must be positive")
 
 
 class StepDiagnostics(NamedTuple):
@@ -280,18 +283,27 @@ def semi_implicit_step(
 ) -> tuple[Array, StepDiagnostics]:
     """Perform the specified semi-implicit TDV-QSM update exactly.
 
-    This solves ``(I + tau AᴴMᴴWᴴWMA) chi_next = chi + tau(AᴴMᴴWᴴWMb - g)``.
-    It reduces to the requested QSM equation when M and W are absent.
+    This solves ``(I + tau AᴴMᴴWᴴWMA) chi_next = chi + tau(AᴴMᴴWᴴWMb - g)``,
+    where ``g = ∇_chi [lambda R_theta(regularizer_mask * chi)]``. It reduces to the
+    requested QSM equation when the data weights and regularizer mask are
+    absent.
     """
 
-    energy = tdv_energy(params, chi, tdv_config, regularizer_mask)
+    # This is the scalar energy lambda * R_theta, not a separately learned
+    # force. Keeping lambda explicit permits conservative rollouts without
+    # changing TDV's architecture or energy-gradient relationship.
+    energy = reconstruction_config.regularizer_weight * tdv_energy(
+        params, chi, tdv_config, regularizer_mask
+    )
     if reconstruction_config.remat_force:
         # Keep non-array architecture metadata out of remat's traced arguments.
-        force = jax.checkpoint(
+        force = reconstruction_config.regularizer_weight * jax.checkpoint(
             lambda image: tdv_force(params, image, tdv_config, regularizer_mask)
         )(chi)
     else:
-        force = tdv_force(params, chi, tdv_config, regularizer_mask)
+        force = reconstruction_config.regularizer_weight * tdv_force(
+            params, chi, tdv_config, regularizer_mask
+        )
     right_hand_data = data_rhs(local_field, kernel, observation_mask, statistical_weight)
     rhs = chi + tau * (right_hand_data - force)
     operator = lambda image: image + tau * data_normal(

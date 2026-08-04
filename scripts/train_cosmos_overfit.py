@@ -37,12 +37,54 @@ def main() -> None:
         default=1.0,
         help="Global gradient-norm clipping threshold applied before Adam (default: 1.0)",
     )
+    parser.add_argument(
+        "--max-parameter-update-norm",
+        type=float,
+        default=0.012,
+        help="Global trust-region bound for each post-Adam parameter update (default: 0.012)",
+    )
+    parser.add_argument(
+        "--max-candidate-force-norm",
+        type=float,
+        default=500.0,
+        help="Reject a post-update rollout when its energy-derived TDV force exceeds this norm (default: 500)",
+    )
+    parser.add_argument(
+        "--max-candidate-loss-ratio",
+        type=float,
+        default=1.05,
+        help="Reject a post-update rollout if its loss rises by more than this factor (default: 1.05)",
+    )
+    parser.add_argument(
+        "--max-update-backtracks",
+        type=int,
+        default=12,
+        help="Halving attempts for a rejected Adam update before rollback (default: 12)",
+    )
+    parser.add_argument(
+        "--max-consecutive-rejections",
+        type=int,
+        default=5,
+        help="Stop after this many consecutive rejected updates and keep the best finite checkpoint (default: 5)",
+    )
+    parser.add_argument(
+        "--restore-best-parameters",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save the lowest-loss finite state observed during training (default: enabled)",
+    )
     parser.add_argument("--data-consistency-weight", type=float, default=0.0)
     parser.add_argument("--features", type=int, default=1)
     parser.add_argument("--macro-blocks", type=int, default=1)
     parser.add_argument("--steps", type=int, default=1)
     parser.add_argument("--cg-iterations", type=int, default=12)
     parser.add_argument("--max-time", type=float, default=0.25)
+    parser.add_argument(
+        "--regularizer-weight",
+        type=float,
+        default=1.0,
+        help="Positive scalar multiplying the TDV scalar energy and its gradient",
+    )
     parser.add_argument("--log-every", type=int, default=1, help="Persist every epoch in convergence.csv")
     parser.add_argument("--epoch-chunk-size", type=int, default=2, help="Static JAX updates per synchronized chunk")
     parser.add_argument("--remat-force", action="store_true")
@@ -100,11 +142,18 @@ def main() -> None:
         cg_iterations=arguments.cg_iterations,
         max_time=arguments.max_time,
         remat_force=arguments.remat_force,
+        regularizer_weight=arguments.regularizer_weight,
     )
     overfit_config = OverfitConfig(
         iterations=arguments.iterations,
         learning_rate=arguments.learning_rate,
         max_gradient_norm=arguments.max_gradient_norm,
+        max_parameter_update_norm=arguments.max_parameter_update_norm,
+        max_candidate_force_norm=arguments.max_candidate_force_norm,
+        max_candidate_loss_ratio=arguments.max_candidate_loss_ratio,
+        max_update_backtracks=arguments.max_update_backtracks,
+        max_consecutive_rejections=arguments.max_consecutive_rejections,
+        restore_best_parameters=arguments.restore_best_parameters,
         data_consistency_weight=arguments.data_consistency_weight,
         seed=arguments.seed,
         log_every=arguments.log_every,

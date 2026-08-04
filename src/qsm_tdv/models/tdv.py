@@ -182,18 +182,17 @@ def tdv_energy(
 ) -> Array:
     """Return one scalar TDV energy for each batch element.
 
-    A mask is an explicit voxel integration weight, never an implicit part of
-    the dipole operator.  It must have either one channel or the local-energy
-    channel count (one).
+    When supplied, ``mask`` is applied to the susceptibility before the TDV
+    network, so this evaluates ``R_theta(mask * chi)``. It is never an
+    implicit part of the physical dipole operator. The mask must have the
+    same NDHWC shape as ``chi``.
     """
 
-    local_energy = tdv_local_energy(params, chi, config)
     if mask is not None:
-        if mask.shape != local_energy.shape:
-            raise ValueError(
-                f"TDV mask must match local energy shape {local_energy.shape}, got {mask.shape}"
-            )
-        local_energy = local_energy * mask.astype(local_energy.dtype)
+        if mask.shape != chi.shape:
+            raise ValueError(f"TDV mask must match chi shape {chi.shape}, got {mask.shape}")
+        chi = chi * mask.astype(chi.dtype)
+    local_energy = tdv_local_energy(params, chi, config)
     return jnp.sum(local_energy, axis=(1, 2, 3, 4))
 
 
@@ -203,7 +202,7 @@ def tdv_force(
     config: TDVConfig,
     mask: Array | None = None,
 ) -> Array:
-    """Evaluate ``∇_chi sum_b R_theta(chi_b)`` without detaching it."""
+    """Evaluate ``∇_chi sum_b R_theta(mask_b * chi_b)`` without detaching it."""
 
     def total_energy(image: Array) -> Array:
         return jnp.sum(tdv_energy(params, image, config, mask))
@@ -218,7 +217,7 @@ def tdv_hessian_vector_product(
     config: TDVConfig,
     mask: Array | None = None,
 ) -> Array:
-    """Compute ``∇²R(chi) @ vector`` by JVP; no Hessian is materialised."""
+    """Compute ``∇²_chi R(mask * chi) @ vector`` by JVP without a full Hessian."""
 
     force = lambda image: tdv_force(params, image, config, mask)
     _, hessian_vector = jax.jvp(force, (chi,), (vector,))

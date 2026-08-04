@@ -17,6 +17,12 @@ The TDV convolutional network uses zero `SAME` padding. This edge convention
 is intentionally documented separately from the periodic forward physics. A
 future padded or cropped physical model must implement and test its padding
 and cropping adjoints instead of hiding them inside the dipole operator.
+When a brain mask is supplied, TDV evaluates
+\(R_\theta(M\odot\chi)\), not a mask-weighted spatial sum of
+\(R_\theta(\chi)\). Its force is differentiated with respect to the original
+state, so automatic differentiation supplies the leading mask factor in
+\(\nabla_\chi R_\theta(M\odot\chi)\). The mask is not folded into the
+physical dipole operator.
 
 Fixed CG makes the unrolled computation static and differentiable. It is the
 first implementation route; an implicit-gradient solver may be added only

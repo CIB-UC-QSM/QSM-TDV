@@ -11,7 +11,9 @@ The NPZ uses float32 unbatched `[Z,Y,X,1]` arrays:
 - `chi_init`: legacy compatibility array. Newly generated samples store
   `W * local_field`; the loader derives the canonical initial state
   χ_0 = `W * local_field` and ignores any stored value;
-- `brain_mask`: non-negative regularizer integration and observation mask;
+- `brain_mask`: non-negative support mask applied to susceptibility before the
+  TDV regularizer, \(R_\theta(\text{brain_mask}\odot\chi)\), and used in the
+  default observation weight;
 - `reference_mask` (optional): non-negative supervised-loss mask;
 - `magnitude` (optional): non-negative magnitude map used to form the default
   data weight \(W=\text{brain_mask}\cdot\text{magnitude}\);

@@ -4,7 +4,7 @@ An energy-based JAX implementation of Total Deep Variation (TDV) for 3D
 quantitative susceptibility mapping. It implements the required chain
 
 ```text
-chi -> R_theta(chi) -> grad_chi R_theta(chi) -> semi-implicit QSM solver -> chi_S
+chi -> R_theta(M * chi) -> grad_chi R_theta(M * chi) -> semi-implicit QSM solver -> chi_S
 ```
 
 It does not contain a direct field-to-susceptibility CNN.
@@ -153,13 +153,15 @@ three-scale U-Net-like macro-blocks. Each macro-block has exactly five
 bias-free residual micro-blocks and uses the smooth log-Student-t activation.
 The final 1×1×1 convolution gives local energy density; summing it gives one
 scalar energy per batch item. The regularisation force is always
-`jax.grad(sum(R_theta))`; it is never a separately predicted vector field.
+`jax.grad(sum(R_theta(M * chi)))`, where `M` is the explicit brain mask; it
+is never a separately predicted vector field. The mask is applied before the
+TDV network and is never folded into the physical dipole operator.
 
 For `S` steps and `tau = T/S`, the solver uses fixed-iteration CG to solve
 
 \[
 (I + \tau A^H A)\chi_{s+1}
-= \chi_s + \tau[A^Hb - \nabla_\chi R_\theta(\chi_s)].
+= \chi_s + \tau[A^Hb - \nabla_\chi R_\theta(M\odot\chi_s)].
 \]
 
 Training and evaluation form one explicit data weight
