@@ -5,21 +5,17 @@ description = "Energy-based Total Deep Variation for 3D quantitative susceptibil
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "jax>=0.6.0",
     "matplotlib>=3.9",
     "numpy>=2.0",
     "scipy>=1.15",
+    "torch>=2.13.0",
 ]
 
 [dependency-groups]
 dev = ["pytest>=8.0"]
 
 [project.scripts]
-qsm-tdv-generate-synthetic = "qsm_tdv.data.synthetic:main"
-qsm-tdv-generate-cosmos = "qsm_tdv.data.cosmos:main"
-qsm-tdv-overfit = "qsm_tdv.training.overfit:main"
-qsm-tdv-validate = "qsm_tdv.training.validate:main"
-qsm-tdv-evaluate = "qsm_tdv.evaluation.input_set:main"
+tdv-qsm-train = "tdv_qsm.train:main"
 
 [build-system]
 requires = ["setuptools>=68"]

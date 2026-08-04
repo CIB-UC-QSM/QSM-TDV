@@ -1,10 +1,10 @@
-# TDV for 3D Quantitative Susceptibility Mapping
+# TDV-QSM
 
-## 1. Mission
+## 1. Mission and fidelity boundary
 
-Implement **Total Deep Variation (TDV)** as a learned scalar regularizer for 3D Quantitative Susceptibility Mapping (QSM).
+Implement **Total Deep Variation (TDV)** for 3D QSM reconstruction in PyTorch.
 
-TDV must not directly predict the susceptibility map. The neural network represents an energy
+The network represents a learned scalar energy
 
 \[
 R_\theta(\chi)\in\mathbb{R},
@@ -13,115 +13,155 @@ R_\theta(\chi)\in\mathbb{R},
 and the reconstruction uses its gradient
 
 \[
-\nabla_\chi R_\theta(\chi)
+\nabla_\chi R_\theta(\chi).
 \]
 
-inside a physics-based variational solver.
+The network must not directly predict susceptibility through a mapping \(b\mapsto\chi\).
 
-The required computational chain is
+The original TDV paper starts from the same continuous gradient flow, but uses a semi-implicit discretization. This project deliberately uses **explicit Euler / plain gradient descent**:
 
 \[
-\chi
-\rightarrow
-R_\theta(\chi)
-\rightarrow
-\nabla_\chi R_\theta(\chi)
-\rightarrow
-\text{semi-implicit QSM reconstruction}
-\rightarrow
-\chi_S.
+\chi_{s+1}
+=
+\chi_s-\tau\nabla_\chi E_\theta(\chi_s;b).
 \]
 
-Do not replace this structure with a direct CNN mapping \(b\mapsto\chi\).
+Do not describe this implementation as an exact reproduction of the original semi-implicit TDV discretization.
 
 ---
 
-## 2. QSM forward model
+## 2. QSM physical model
 
-Use the unitary discrete Fourier model
+Use
 
 \[
-b = \mathcal{F}^{H}D\mathcal{F}\chi+\eta,
+b=\mathcal F^{H}D\mathcal F\chi+\eta,
 \]
 
 where:
 
-- \(\chi\): 3D magnetic susceptibility map;
-- \(b\): measured local field;
-- \(\eta\): measurement and modeling error;
-- \(\mathcal{F}\): unitary 3D discrete Fourier transform;
-- \(\mathcal{F}^{H}\): inverse/adjoint unitary Fourier transform;
-- \(D\): diagonal multiplication by the dipole kernel in k-space.
+- \(\chi\): 3D susceptibility map;
+- \(b\): local field;
+- \(\eta\): noise and modeling error;
+- \(\mathcal F\): unitary 3D FFT;
+- \(\mathcal F^{H}\): inverse/adjoint FFT;
+- \(D\): diagonal dipole-kernel operator in k-space.
 
 Define
 
 \[
-A = \mathcal{F}^{H}D\mathcal{F}.
+A=\mathcal F^{H}D\mathcal F.
 \]
 
-For a real, symmetric dipole kernel,
+When convolution notation is used below,
 
 \[
-A^{H}=A.
-\]
-
-The data fidelity is
-
-\[
-D_{\text{data}}(\chi,b)
+X * \chi
+\equiv
+\mathcal F^{H}D\mathcal F\chi
 =
-\frac12\|A\chi-b\|_2^2.
+A\chi.
+\]
+
+Here, \(X\) denotes the spatial dipole-convolution kernel corresponding to \(D\). In PyTorch, compute \(X*\chi\) through the FFT-based `operator.forward(chi)` implementation rather than by materializing a dense convolution matrix.
+
+Let \(W\) be the magnitude-derived weighting matrix used in the field domain. For QSM, \(W\) is expected to be a real, nonnegative diagonal operator constructed from the measured signal magnitude. In tensor form, store its diagonal as a spatial weight map with shape `[B, 1, Z, Y, X]`.
+
+The weighted data-fidelity residual is
+
+\[
+r_{\mathrm{data}}
+=
+W(A\chi-b).
+\]
+
+The data-fidelity term is
+
+\[
+D_{\mathrm{data}}(\chi,b;W)
+=
+\frac12\|W(A\chi-b)\|_2^2.
 \]
 
 Its gradient is
 
 \[
-\nabla_\chi D_{\text{data}}
+\nabla_\chi D_{\mathrm{data}}
 =
-A^{H}(A\chi-b).
+A^{H}W^{H}W(A\chi-b).
 \]
 
-If masks or statistical weights are used, they must be introduced explicitly and their adjoints must be implemented exactly. Never silently absorb them into \(A\).
-
----
-
-## 3. Dipole kernel
-
-For spatial frequency \(\mathbf{k}\) and unit field direction \(\widehat{\mathbf{B}}_0\),
+For the expected real diagonal weighting matrix,
 
 \[
-d(\mathbf{k})
+W^{H}=W,
+\]
+
+so
+
+\[
+\nabla_\chi D_{\mathrm{data}}
 =
-\frac13
--
-\frac{(\mathbf{k}\cdot\widehat{\mathbf{B}}_0)^2}
-{\|\mathbf{k}\|_2^2},
+A^{H}W^2(A\chi-b).
+\]
+
+Do not replace this gradient with \(A^H W(A\chi-b)\): when the loss is the squared norm of \(W(A\chi-b)\), the chain rule produces \(W^H W\).
+
+For a real dipole kernel, \(A^H=A\), but `forward` and `adjoint` must still be implemented as separate interfaces.
+
+The exact construction of \(W\) from signal magnitude—normalization, clipping, masking, and scaling—must be defined in preprocessing configuration and recorded in dataset metadata. Do not silently invent or change that transformation.
+
+### Dipole kernel
+
+\[
+d(\mathbf k)
+=
+\frac13-
+\frac{(\mathbf k\cdot\widehat{\mathbf B}_0)^2}
+{\|\mathbf k\|_2^2},
 \qquad
-d(\mathbf{0})=0.
+d(\mathbf0)=0.
 \]
 
 Requirements:
 
-- support anisotropic voxel sizes;
-- support arbitrary \(\widehat{\mathbf{B}}_0\);
-- use one documented axis convention;
-- use orthonormal FFT normalization;
-- preserve the forward/adjoint identity numerically;
-- do not threshold the dipole kernel inside the physical forward operator;
-- document periodic, padded, or cropped boundary conditions.
+- image tensors use `[B, C, Z, Y, X]`;
+- metadata order is always `zyx`;
+- `voxel_size_zyx = [vz, vy, vx]`;
+- `b0_direction_zyx = [bz, by, bx]`;
+- support anisotropic voxels;
+- normalize \(\widehat{\mathbf B}_0\);
+- use `norm="ortho"` for FFT and IFFT;
+- do not apply TKD or dipole thresholding inside the physical operator;
+- explicitly document padding, cropping, masks, and boundary conditions.
 
-For JAX, use tensors in NDHWC format:
+### PyTorch equivalent
 
-\[
-[B,Z,Y,X,C].
-\]
+```python
+FFT_DIMS = (-3, -2, -1)
 
-Metadata order is always:
+def fft3(x: torch.Tensor) -> torch.Tensor:
+    return torch.fft.fftn(x.float(), dim=FFT_DIMS, norm="ortho")
 
-- voxel size: \([v_z,v_y,v_x]\);
-- field direction: \([B_{0,z},B_{0,y},B_{0,x}]\).
+def ifft3(x: torch.Tensor) -> torch.Tensor:
+    return torch.fft.ifftn(x, dim=FFT_DIMS, norm="ortho").real
 
-Never infer the \(B_0\) direction from array shape.
+def dipole_forward(
+    chi: torch.Tensor,
+    dipole_kernel: torch.Tensor,
+) -> torch.Tensor:
+    return ifft3(fft3(chi) * dipole_kernel)
+
+def dipole_adjoint(
+    value: torch.Tensor,
+    dipole_kernel: torch.Tensor,
+) -> torch.Tensor:
+    return ifft3(fft3(value) * dipole_kernel.conj())
+```
+
+FFT operations must always run in `float32/complex64`, never in `float16`.
+
+
 
 Reference code:
 ```python
@@ -152,40 +192,40 @@ def continuous_dipole_kernel(
 
 ---
 
-## 4. TDV regularizer
+## 3. TDV energy
 
-The TDV energy is
+Define
 
 \[
 R_\theta(\chi)
 =
-\sum_{i=1}^{n} r_\theta(\chi)_i,
-\]
-
-with local energy density
-
-\[
+\sum_{i=1}^{n}r_{\theta,i}(\chi),
+\qquad
 r_\theta(\chi)
 =
-w^{\top}N_\theta(K\chi).
-\]
-
-Interpret this voxelwise:
-
-\[
-r_{\theta,i}(\chi)
-=
-w^{\top}N_\theta(K\chi)_i.
+w^\top N_\theta(K\chi).
 \]
 
 Components:
 
-- \(K\): learned analysis convolution;
-- \(N_\theta\): learned multiscale convolutional network;
-- \(w\): learned channel-combination vector or \(1\times1\times1\) convolution;
-- \(R_\theta(\chi)\): one scalar energy per sample.
+- \(K\): learned 3D analysis convolution;
+- \(N_\theta\): learned multiscale CNN;
+- \(w\): channel-combination layer, implemented as `Conv3d(..., out_channels=1, kernel_size=1)`;
+- \(r_\theta\): voxelwise energy density;
+- \(R_\theta\): one scalar energy per sample.
 
-The regularization force is
+Canonical shapes:
+
+```text
+chi:             [B, 1, Z, Y, X]
+K(chi):          [B, m, Z, Y, X]
+N(K(chi)):       [B, q, Z, Y, X]
+energy_density:  [B, 1, Z, Y, X]
+energy:          [B] float32
+grad_R:          [B, 1, Z, Y, X] float32
+```
+
+The regularization force must be exactly
 
 \[
 g_\theta(\chi)
@@ -193,25 +233,11 @@ g_\theta(\chi)
 \nabla_\chi R_\theta(\chi).
 \]
 
-It must have the same shape as \(\chi\).
+Do not use an independent vector-valued network output as the force.
 
-The full Hessian must never be materialized. Use automatic differentiation for Hessian-vector products and mixed derivatives.
+### Micro-block
 
----
-
-## 5. TDV network structure
-
-A \(\mathrm{TDV}^{L}\) model contains \(L\) consecutive macro-blocks:
-
-\[
-N_\theta
-=
-\operatorname{Ma}^{L}\circ\cdots\circ\operatorname{Ma}^{1}.
-\]
-
-Each macro-block is a three-scale U-Net-like module with skip connections and five residual micro-blocks.
-
-Each micro-block has the form
+Each micro-block must be
 
 \[
 \operatorname{Mi}(u)
@@ -219,9 +245,7 @@ Each micro-block has the form
 u+K_2\phi(K_1u),
 \]
 
-where \(K_1\) and \(K_2\) are bias-free 3D convolutions.
-
-Use the smooth log-Student-t activation
+with bias-free 3D convolutions and
 
 \[
 \phi(a)
@@ -229,415 +253,732 @@ Use the smooth log-Student-t activation
 \frac{1}{2\nu}\log(1+\nu a^2).
 \]
 
-Its derivatives are
+```python
+def log_student_t(
+    x: torch.Tensor,
+    nu: float = 9.0,
+) -> torch.Tensor:
+    return torch.log1p(nu * x.square()) / (2.0 * nu)
 
-\[
-\phi'(a)=\frac{a}{1+\nu a^2},
-\]
+def forward(self, x: torch.Tensor) -> torch.Tensor:
+    return x + self.conv2(
+        log_student_t(self.conv1(x), self.nu)
+    )
+```
 
-\[
-\phi''(a)
-=
-\frac{1-\nu a^2}{(1+\nu a^2)^2}.
-\]
+### Architecture
 
-Do not replace it with ReLU while claiming to preserve the original smooth TDV formulation.
+A `TDV^L` configuration contains \(L\) macro-blocks. Each macro-block uses:
 
----
+- three spatial scales;
+- five residual micro-blocks;
+- skip connections;
+- antialiased downsampling;
+- upsampling;
+- \(1\times1\times1\) fusion convolutions.
 
-## 6. Zero-mean analysis kernel
-
-Each output filter of \(K\) must satisfy
-
-\[
-\sum_j K_{a,j}=0.
-\]
-
-For a 3D convolution, sum over all input channels and spatial kernel positions.
-
-After every optimizer update, project
-
-\[
-K_a
-\leftarrow
-K_a-\operatorname{mean}(K_a).
-\]
-
-This projection is part of training and must not be omitted.
+Implement a small `TDV^1` model first and validate all gradients before scaling the architecture.
 
 ---
 
-## 7. Variational QSM energy
+## 4. Zero-mean analysis kernel
 
-The reconstruction energy is
+Each output filter of the first analysis kernel \(K\) must satisfy
 
 \[
-E(\chi;\theta,b)
+\sum_{c,z,y,x}K_{o,c,z,y,x}=0.
+\]
+
+After every optimizer step:
+
+```python
+@torch.no_grad()
+def project_zero_mean_(conv: nn.Conv3d) -> None:
+    weight = conv.weight
+    weight.sub_(
+        weight.mean(
+            dim=(1, 2, 3, 4),
+            keepdim=True,
+        )
+    )
+```
+
+Do not use `.data`.
+
+---
+
+## 5. Explicit gradient-descent reconstruction
+
+The total energy is
+
+\[
+E_\theta(\chi;b,W)
 =
-\frac12\|A\chi-b\|_2^2
+\frac12\|W(A\chi-b)\|_2^2
 +
 R_\theta(\chi).
 \]
 
-The continuous gradient flow is
+Its gradient is
 
 \[
-\dot{\widetilde{\chi}}(t)
+\nabla_\chi E_\theta
 =
--A^{H}(A\widetilde{\chi}(t)-b)
--
-\nabla_\chi R_\theta(\widetilde{\chi}(t)).
+A^{H}W^{H}W(A\chi-b)
++
+\nabla_\chi R_\theta(\chi).
 \]
 
-Learn a stopping time \(T\in[0,T_{\max}]\). Reparameterize time by
+For real diagonal \(W\),
 
 \[
-\chi(t)=\widetilde{\chi}(tT),
-\qquad t\in[0,1].
-\]
-
-Then
-
-\[
-\dot{\chi}(t)
+\nabla_\chi E_\theta
 =
-T\left[
--A^{H}(A\chi(t)-b)
--
-\nabla_\chi R_\theta(\chi(t))
-\right].
+A^{H}W^2(A\chi-b)
++
+\nabla_\chi R_\theta(\chi).
 \]
 
----
-
-## 8. Semi-implicit reconstruction
-
-Fix a number of steps \(S\) and define
-
-\[
-\tau=\frac{T}{S}.
-\]
-
-Use the semi-implicit update
-
-\[
-\chi_{s+1}
-=
-\chi_s
--\tau A^{H}(A\chi_{s+1}-b)
--\tau\nabla_\chi R_\theta(\chi_s).
-\]
-
-Equivalently,
+Use \(S\) explicit Euler steps:
 
 \[
 \boxed{
-(I+\tau A^{H}A)\chi_{s+1}
+\chi_{s+1}
 =
-\chi_s
+\chi_s-\tau
+\left[
+A^{H}W^{H}W(A\chi_s-b)
 +
-\tau
-\left(
-A^{H}b
--
 \nabla_\chi R_\theta(\chi_s)
-\right).
+\right].
 }
 \]
 
-Each step must:
-
-1. evaluate \(R_\theta(\chi_s)\);
-2. compute \(g_s=\nabla_\chi R_\theta(\chi_s)\);
-3. form
-   \[
-   q_s=\chi_s+\tau(A^{H}b-g_s);
-   \]
-4. solve
-   \[
-   (I+\tau A^{H}A)\chi_{s+1}=q_s.
-   \]
-
-Use the same \(\theta\) at every step.
-
-The linear system is Hermitian positive definite for \(\tau>0\). Use fixed-iteration conjugate gradient or a validated implicit linear solver.
-
----
-
-## 9. Training problem
-
-Training samples are triplets
+Parameterize the learned stopping time as
 
 \[
-(\chi_{\mathrm{init}}^i,\chi_{\mathrm{ref}}^i,b^i).
+T=T_{\max}\sigma(\alpha),
+\qquad
+\tau=\frac{T}{S}.
 \]
 
-The learned variables are:
-
-\[
-\theta
-\quad\text{and}\quad
-T.
-\]
-
-The discrete training objective is
-
-\[
-\min_{\theta,T}
-J_S(T,\theta)
-=
-\frac1N
-\sum_{i=1}^{N}
-\ell(\chi_S^i-\chi_{\mathrm{ref}}^i),
-\]
-
-subject to the \(S\)-step semi-implicit dynamics.
-
-Training procedure:
-
-1. compute
-   \[
-   T=T_{\max}\sigma(\alpha),
-   \qquad
-   \tau=T/S;
-   \]
-2. initialize
-   \[
-   \chi_0=\chi_{\mathrm{init}};
-   \]
-3. unroll \(S\) TDV-QSM steps;
-4. compute the terminal supervised loss;
-5. optionally add an explicitly weighted data-consistency term;
-6. differentiate through:
-   - \(\nabla_\chi R_\theta\);
-   - all TDV steps;
-   - the linear solves;
-   - the stopping-time parameter;
-7. update parameters with Adam;
-8. project \(K\) to zero mean.
-
-TDV is trained with automatic differentiation and Adam. Do not implement MSA or an explicit Hamiltonian maximization unless a new research variant is requested.
-
----
-
-## 10. Higher-order autodifferentiation
-
-Because every reconstruction step uses
-
-\[
-\nabla_\chi R_\theta(\chi),
-\]
-
-training requires mixed derivatives
-
-\[
-\frac{\partial}{\partial\theta}
-\nabla_\chi R_\theta(\chi)
-\]
-
-and Hessian-vector products
-
-\[
-\nabla_\chi^2R_\theta(\chi)v.
-\]
-
-Requirements:
-
-- do not apply `stop_gradient` to the regularization force during training;
-- do not replace the energy gradient with an independent network output;
-- do not construct full Jacobians or Hessians;
-- verify gradients against finite differences on small problems.
-
-In JAX, the intended pattern is:
+PyTorch equivalent:
 
 ```python
-def total_energy(theta, chi, mask):
-    return regularizer.apply({"params": theta}, chi, mask).sum()
+T = T_max * torch.sigmoid(raw_time)
+tau = T / num_steps
 
-regularizer_force = jax.grad(total_energy, argnums=1)
+predicted_field = operator.forward(chi)
+field_residual = predicted_field - local_field.float()
+
+# W is a real diagonal matrix represented by its voxelwise diagonal.
+weighted_residual = magnitude_weight.float() * field_residual
+normal_weighted_residual = (
+    magnitude_weight.float() * weighted_residual
+)
+
+data_grad = operator.adjoint(
+    normal_weighted_residual
+)
+
+energy = regularizer.energy(chi, mask)
+
+grad_R, = torch.autograd.grad(
+    energy.sum(),
+    chi,
+    create_graph=model.training,
+    retain_graph=model.training,
+)
+
+chi = chi - tau.float() * (data_grad + grad_R)
+chi = chi * mask
 ```
 
-The outer training loss must be differentiated with respect to all model parameters.
+The same parameter set \(\theta\) must be shared across all steps.
+
+Do not use conjugate gradient, matrix inverses, proximal updates, or semi-implicit steps in this variant.
 
 ---
 
-## 11. JAX implementation rules
+## 6. float16 precision contract
 
-- Use pure functions for operators and solvers.
-- Use `jax.lax.scan` for TDV steps and fixed CG iterations.
-- Keep iteration counts static.
-- Use NDHWC tensors.
-- Use `float32` for states and solvers.
-- Use `complex64` for FFT operations.
-- Use orthonormal FFT normalization.
-- Use `jax.checkpoint`/`jax.remat` when needed for memory.
-- Start by differentiating through fixed CG iterations.
-- Use implicit differentiation only after validating equivalence.
-- Avoid dynamic shapes inside jitted functions.
-- Never mutate parameters inside `jit`.
+“Use float16” means **stable mixed precision with AMP**, not converting the complete system to half precision.
+
+### Run under float16 autocast
+
+- TDV convolutions;
+- TDV activations;
+- multiscale blocks and fusion layers.
+
+### Keep in float32/complex64
+
+- state \(\chi_s\);
+- local field \(b\);
+- masks and weights;
+- dipole kernel;
+- FFT and IFFT;
+- physical gradient;
+- energy reduction;
+- \(\nabla_\chi R_\theta\);
+- explicit state update;
+- loss;
+- master parameters;
+- Adam optimizer state.
+
+Never call `model.half()`.
+
+### Mandatory pattern
+
+```python
+def energy(
+    self,
+    chi: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    with torch.autocast(
+        device_type="cuda",
+        dtype=torch.float16,
+        enabled=chi.is_cuda,
+    ):
+        density = self.energy_density(chi)
+
+    return (
+        density.float() * mask.float()
+    ).flatten(1).sum(dim=1)
+```
+
+Compute the image gradient outside autocast:
+
+```python
+energy = regularizer.energy(chi, mask)
+
+grad_R, = torch.autograd.grad(
+    energy.sum(),
+    chi,
+    create_graph=True,
+)
+```
+
+Training must use `GradScaler`:
+
+```python
+scaler = torch.amp.GradScaler(
+    "cuda",
+    enabled=torch.cuda.is_available(),
+)
+
+scaler.scale(loss).backward()
+scaler.unscale_(optimizer)
+
+torch.nn.utils.clip_grad_norm_(
+    model.parameters(),
+    max_norm=1.0,
+)
+
+scaler.step(optimizer)
+scaler.update()
+
+model.regularizer.project_zero_mean_()
+```
 
 ---
 
-## 12. QSM data contract
+## 7. Required reconstruction interface
 
-Each sample must define:
+```python
+class ExplicitTDVQSM3D(nn.Module):
+    regularizer: TDVEnergy3D
+    raw_time: nn.Parameter
+    num_steps: int
+    maximum_time: float
 
-- `local_field`: \(b\), shape `[Z,Y,X,1]`;
-- `susceptibility`: reference \(\chi\), same spatial shape;
-- `brain_mask`;
-- optional `reference_mask`;
-- optional statistical weight map;
-- `voxel_size_zyx`;
-- `b0_direction_zyx`;
-- explicit field and susceptibility units;
-- explicit susceptibility-reference convention;
-- anonymized subject identifier;
-- source and processing version.
+    def forward(
+        self,
+        local_field: torch.Tensor,
+        mask: torch.Tensor,
+        dipole_kernel: torch.Tensor,
+        magnitude_weight: torch.Tensor,
+        initial: torch.Tensor,
+        *,
+        return_states: bool = False,
+    ) -> TDVOutput:
+        ...
+```
+
+Forward-pass rules:
+
+1. validate `[B,1,Z,Y,X]` shapes;
+2. convert all physical inputs, including `magnitude_weight`, to `float32`;
+3. validate that `magnitude_weight` is finite, nonnegative, and broadcast-compatible with `local_field`;
+4. initialize `chi = initial.float().requires_grad_(True)`;
+5. compute \(T\) and \(\tau\) once;
+6. execute exactly \(S\) steps;
+7. do not detach states between steps during training;
+8. during inference, locally enable gradients to evaluate \(\nabla_\chi R_\theta\);
+9. return reconstruction, predicted field, and optional intermediate states.
+
+Do not wrap the complete inference pass in `torch.no_grad()` because the gradient with respect to \(\chi\) is still required.
+
+---
+
+## 8. Training contract
+
+Each sample must provide:
+
+```text
+local_field       float32 [B,1,Z,Y,X]
+susceptibility    float32 [B,1,Z,Y,X]
+brain_mask        float32 [B,1,Z,Y,X]
+magnitude_weight  float32 [B,1,Z,Y,X]
+reference_mask    optional
+voxel_size_zyx    float32 [B,3]
+b0_direction_zyx float32 [B,3]
+initial           float32 [B,1,Z,Y,X]
+```
+
+### Primary training loss: NRMSE
+
+Use NRMSE as the primary supervised loss and as the reported evaluation metric:
+
+\[
+\operatorname{NRMSE}(x_{\mathrm{pred}},x_{\mathrm{true}})
+=
+\frac{
+\left\|x_{\mathrm{pred}}-x_{\mathrm{true}}\right\|_2
+}{
+\left\|x_{\mathrm{true}}\right\|_2
+}.
+\]
+
+Compute it independently for every batch element and then average across the batch. Add a small numerical \(\varepsilon\) only to protect the denominator:
+
+\[
+\mathcal L_{\mathrm{NRMSE}}
+=
+\frac1B
+\sum_{i=1}^{B}
+\frac{
+\left\|x_{\mathrm{pred}}^i-x_{\mathrm{true}}^i\right\|_2
+}{
+\max\!\left(
+\left\|x_{\mathrm{true}}^i\right\|_2,
+\varepsilon
+\right)
+}.
+\]
+
+If a brain mask or susceptibility-reference operation is required, apply it first and define the resulting tensors as \(x_{\mathrm{pred}}\) and \(x_{\mathrm{true}}\). The NRMSE formula itself must not be changed.
+
+```python
+def nrmse(
+    x_pred: torch.Tensor,
+    x_true: torch.Tensor,
+    *,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    pred = x_pred.float().flatten(start_dim=1)
+    true = x_true.float().flatten(start_dim=1)
+
+    error_norm = torch.linalg.vector_norm(
+        pred - true,
+        ord=2,
+        dim=1,
+    )
+    true_norm = torch.linalg.vector_norm(
+        true,
+        ord=2,
+        dim=1,
+    ).clamp_min(eps)
+
+    return (error_norm / true_norm).mean()
+```
+
+Use this same function for:
+
+- the supervised training loss;
+- validation NRMSE;
+- test-set NRMSE;
+- checkpoint selection unless another criterion is explicitly approved.
+
+### Magnitude-weighted data-consistency term
+
+Define \(W\) as a real, nonnegative diagonal matrix derived from the signal magnitude. In PyTorch, represent the diagonal of \(W\) as `magnitude_weight` with shape `[B, 1, Z, Y, X]`.
+
+The data-consistency residual is exactly
+
+\[
+r_{\mathrm{dc}}
+=
+W(A\chi_S-b).
+\]
+
+In tensor form:
+
+\[
+r_{\mathrm{dc}}
+=
+W\odot(A\chi_S-b).
+\]
+
+The optional data-consistency loss is
+
+\[
+\mathcal L_{\mathrm{dc}}
+=
+\frac1B
+\sum_{i=1}^{B}
+\frac{
+\left\|
+W^i(A\chi_S^i-b^i)
+\right\|_2^2
+}{
+\max(N_i,1)
+},
+\]
+
+where \(N_i\) is the number of evaluated field voxels. If a field-domain mask is required, apply it explicitly and document whether it is already included in \(W\).
+
+```python
+def weighted_data_consistency_loss(
+    chi_pred: torch.Tensor,
+    local_field: torch.Tensor,
+    magnitude_weight: torch.Tensor,
+    operator,
+    *,
+    field_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    weight = magnitude_weight.float()
+
+    if not torch.isfinite(weight).all():
+        raise ValueError("Magnitude weights must be finite.")
+    if torch.any(weight < 0):
+        raise ValueError("Magnitude weights must be nonnegative.")
+
+    predicted_field = operator.forward(
+        chi_pred.float()
+    )
+    residual = predicted_field - local_field.float()
+    weighted_residual = weight * residual
+
+    if field_mask is not None:
+        field_mask = field_mask.float()
+        weighted_residual = weighted_residual * field_mask
+        voxel_count = (
+            field_mask.flatten(1)
+            .sum(dim=1)
+            .clamp_min(1.0)
+        )
+    else:
+        voxel_count = torch.full(
+            (weighted_residual.shape[0],),
+            weighted_residual[0].numel(),
+            device=weighted_residual.device,
+            dtype=torch.float32,
+        )
+
+    residual_energy = (
+        weighted_residual.square()
+        .flatten(1)
+        .sum(dim=1)
+    )
+
+    return (residual_energy / voxel_count).mean()
+```
+
+The total training objective is
+
+\[
+\mathcal L
+=
+\mathcal L_{\mathrm{NRMSE}}
++
+\lambda_{\mathrm{dc}}\mathcal L_{\mathrm{dc}},
+\]
+
+where \(\lambda_{\mathrm{dc}}\ge0\) is an explicit configuration value. \(W\) defines spatial reliability from magnitude; \(\lambda_{\mathrm{dc}}\) controls the global contribution of data consistency to the training objective. Do not conflate them.
+
+Do not add intermediate losses by default.
+
+Canonical loop:
+
+```python
+optimizer.zero_grad(set_to_none=True)
+
+output = model(
+    local_field=batch["local_field"],
+    mask=batch["brain_mask"],
+    dipole_kernel=dipole_kernel,
+    magnitude_weight=batch["magnitude_weight"],
+    initial=batch["initial"],
+)
+
+x_pred = (
+    output.susceptibility.float()
+    * batch["brain_mask"].float()
+)
+x_true = (
+    batch["susceptibility"].float()
+    * batch["brain_mask"].float()
+)
+
+loss_nrmse = nrmse(
+    x_pred,
+    x_true,
+)
+
+loss = loss_nrmse
+
+if data_consistency_weight > 0:
+    loss_dc = weighted_data_consistency_loss(
+        chi_pred=output.susceptibility,
+        local_field=batch["local_field"],
+        magnitude_weight=batch["magnitude_weight"],
+        operator=operator,
+        field_mask=batch.get("field_mask"),
+    )
+    loss = loss + data_consistency_weight * loss_dc
+
+if not torch.isfinite(loss):
+    raise FloatingPointError("Non-finite TDV loss")
+
+scaler.scale(loss).backward()
+scaler.unscale_(optimizer)
+
+for name, parameter in model.named_parameters():
+    if (
+        parameter.grad is not None
+        and not torch.isfinite(parameter.grad).all()
+    ):
+        raise FloatingPointError(
+            f"Non-finite gradient: {name}"
+        )
+
+torch.nn.utils.clip_grad_norm_(
+    model.parameters(),
+    1.0,
+)
+
+scaler.step(optimizer)
+scaler.update()
+
+model.regularizer.project_zero_mean_()
+```
+
+During evaluation:
+
+```python
+validation_nrmse = nrmse(
+    x_pred,
+    x_true,
+)
+```
+
+Report NRMSE as a dimensionless scalar. Lower is better.
+
+Use Adam with configuration-driven hyperparameters. Do not hard-code a learning rate without a stability test.
+
+---
+
+## 9. Explicit-step stability
+
+Explicit Euler may diverge when \(\tau\) is too large.
+
+For the quadratic physical term, a sufficient condition is
+
+\[
+0<\tau<\frac{2}{\|A\|_2^2}.
+\]
+
+The learned nonconvex regularizer may require a smaller step.
 
 Rules:
 
-- use subject-level train/validation/test splits;
-- split subjects before patch extraction;
-- never mix patches from one subject across partitions;
-- preserve affine and orientation metadata;
-- transform \(B_0\) consistently when reorienting data;
-- avoid training the global dipole physics on isolated patches without a documented halo or global-field generation strategy;
-- record deterministic seeds and configuration hashes for synthetic data;
-- never include identifiable clinical metadata in manifests or logs.
+- `maximum_time` must be configurable;
+- log \(T\), \(\tau\), loss, `||data_grad||`, `||grad_R||`, and `||chi||`;
+- abort on NaN or Inf;
+- verify that the physical energy does not explode when \(R=0\);
+- do not change \(S\) and \(T\) simultaneously without justification;
+- require a tiny-overfit test before scaling the model.
 
 ---
 
-## 13. Required numerical tests
+## 10. Higher-order automatic differentiation
 
-### Dipole operator
+Training requires
 
-Verify
+\[
+\frac{\partial}{\partial\theta}
+\nabla_\chi R_\theta(\chi).
+\]
+
+Therefore:
+
+- use `torch.autograd.grad(..., create_graph=True)` during training;
+- do not detach `grad_R`;
+- do not use `torch.no_grad()` around the energy;
+- do not materialize full Hessians;
+- do not use in-place operations on `chi`;
+- when using activation checkpointing, pass `use_reentrant=False`.
+
+---
+
+## 11. Mandatory tests
+
+### Physics
+
+1. Adjoint test:
 
 \[
 \frac{
-|\langle A x,y\rangle-\langle x,A^{H}y\rangle|
+|\langle Ax,y\rangle-\langle x,A^Hy\rangle|
 }{
-|\langle A x,y\rangle|
+|\langle Ax,y\rangle|
 +
-|\langle x,A^{H}y\rangle|
-+\varepsilon
+|\langle x,A^Hy\rangle|
++
+\varepsilon
 }
-<
-10^{-5}
+<10^{-5}.
 \]
 
-in `float32` on representative shapes.
-
-Also test:
-
-- zero frequency;
-- arbitrary \(B_0\);
-- anisotropic voxels;
-- odd and even dimensions;
-- padding/cropping adjoints, if used.
+2. Verify `d(0)=0`.
+3. Test arbitrary \(B_0\) directions.
+4. Test anisotropic voxels.
+5. Test even and odd dimensions.
+6. Test adjoint padding/cropping if used.
 
 ### TDV energy
 
-Verify:
+1. `energy.shape == (B,)`.
+2. `energy.dtype == torch.float32`.
+3. `grad_R.shape == chi.shape`.
+4. `grad_R.dtype == torch.float32`.
+5. Directional finite-difference test in float32.
+6. Zero mean for every output filter of \(K\).
 
-- one scalar energy per batch element;
-- \(\nabla_\chi R_\theta\) has the same shape as \(\chi\);
-- directional finite differences agree with the autodiff gradient;
-- the zero-mean projection holds for every analysis filter.
+### Explicit step
 
-### Linear solver
+1. Match the direct mathematical formula.
+2. With \(R=0\), physical loss decreases for sufficiently small \(\tau\).
+3. With \(A=0\), match gradient descent on \(R_\theta\).
+4. Confirm shared parameters across all steps.
+5. Confirm `chi` remains float32.
 
-Verify:
+### Losses, metrics, AMP, and integration
 
-- CG agrees with a dense solve on tiny problems;
-- residuals decrease;
-- no NaNs occur in the expected \(\tau\) range;
-- gradients with respect to the right-hand side pass finite-difference checks.
-
-### Semi-implicit step
-
-Verify the residual
-
-\[
-(I+\tau A^{H}A)\chi_{s+1}
--
-\left[
-\chi_s+\tau(A^{H}b-\nabla_\chi R_\theta(\chi_s))
-\right]
-\]
-
-is below the configured tolerance.
-
-### Training
-
-Verify:
-
-- finite gradients reach all trainable parameter groups;
-- the stopping time receives a finite gradient;
-- a tiny synthetic dataset can be overfit;
-- reconstruction improves over the initialization;
-- inference is deterministic for fixed parameters and inputs.
-
----
-
-## 14. Prohibited changes
-
-Do not make the following changes without explicit approval:
-
-1. Replace the scalar energy with a direct \(b\mapsto\chi\) CNN.
-2. Use a vector field not derived from an energy as the TDV force.
-3. Use different TDV parameters at different steps without documentation.
-4. Apply `stop_gradient` to \(\nabla_\chi R_\theta\) during training.
-5. Materialize full Hessians.
-6. Replace the semi-implicit step with explicit Euler silently.
-7. Omit the zero-mean projection of \(K\).
-8. Confuse \(T\), \(S\), and \(\tau=T/S\).
-9. Threshold the physical dipole kernel inside \(A\).
-10. Treat an approximate inverse as the physical forward operator.
-11. Change units, orientation, reference, masks, or FFT normalization silently.
-12. Claim that TDV was trained with MSA.
+1. NRMSE matches
+   \[
+   \|x_{\mathrm{pred}}-x_{\mathrm{true}}\|_2
+   /
+   \|x_{\mathrm{true}}\|_2
+   \]
+   on a hand-computed tensor.
+2. NRMSE is zero when prediction equals ground truth.
+3. NRMSE is computed per sample and then averaged across the batch.
+4. The denominator protection is used only when the ground-truth norm is below \(\varepsilon\).
+5. The data-consistency residual is exactly
+   \[
+   W(A\chi-b).
+   \]
+6. An all-ones \(W\) reproduces the unweighted residual.
+7. Zero entries of \(W\) remove the corresponding field-residual contributions.
+8. Negative or non-finite entries of \(W\) are rejected.
+9. The physical gradient matches
+   \[
+   A^H W^H W(A\chi-b)
+   \]
+   on a tiny dense reference problem.
+10. AMP output remains close to a float32 reference on a small volume.
+11. No NaN or Inf occurs during 100 synthetic training steps.
+12. Finite gradients reach:
+    - analysis kernel \(K\);
+    - macro-blocks;
+    - energy head;
+    - `raw_time`.
+13. Confirm FFT receives float32 inputs.
+14. Confirm `model.half()` is never called.
+15. Tiny-overfit on 1–4 phantoms.
+16. Final reconstruction improves over initialization.
+17. Inference is deterministic for fixed inputs and parameters.
 
 ---
 
-## 15. Reference execution flow
+## 12. Prohibited changes
+
+Do not:
+
+1. implement a direct U-Net \(b\mapsto\chi\);
+2. use a force that is not derived from a scalar energy;
+3. use different parameters at different steps without documentation;
+4. use CG or semi-implicit updates in this variant;
+5. detach states between steps during training;
+6. run FFT in half precision;
+7. call `model.half()`;
+8. accumulate energy in half precision;
+9. omit `GradScaler`;
+10. omit the zero-mean projection;
+11. use `.data`;
+12. materialize full Hessians;
+13. silently change units, axes, masks, or susceptibility reference;
+14. replace NRMSE with MSE as the primary supervised loss without explicit approval;
+15. report a differently normalized error under the name NRMSE;
+16. implement the data-consistency residual as anything other than \(W(A\chi-b)\);
+17. treat \(W\) as a scalar when magnitude-dependent spatial weighting is configured;
+18. use \(A^H W(A\chi-b)\) as the gradient of \(\frac12\|W(A\chi-b)\|^2\);
+19. construct or normalize \(W\) without a documented preprocessing rule;
+20. claim that explicit Euler is the original published TDV discretization.
+
+---
+
+## 13. Minimal repository structure
 
 ```text
-for each minibatch:
-    read chi_init, chi_ref, b, metadata
-    construct D from voxel size and B0 direction
-    define A(chi) = F^H D F chi
-
-    T = T_max * sigmoid(raw_time)
-    tau = T / S
-    chi = chi_init
-
-    repeat S times:
-        energy = R_theta(chi)
-        force = grad_chi energy
-        rhs = chi + tau * (A_adjoint(b) - force)
-        chi = solve(I + tau * A_adjoint(A), rhs)
-
-    loss = terminal_supervised_loss(chi, chi_ref)
-    loss += optional_weight * data_consistency(chi, b)
-
-    differentiate loss with respect to theta and raw_time
-    apply Adam update
-    project K to zero mean
+src/tdv_qsm/
+  operators/dipole.py
+  models/activation.py
+  models/blocks.py
+  models/energy.py
+  models/explicit_tdv.py
+  losses.py
+  train.py
+tests/
+  test_dipole_adjoint.py
+  test_energy_gradient.py
+  test_explicit_step.py
+  test_amp.py
+  test_tiny_overfit.py
 ```
+
+Before editing:
+
+1. read this file;
+2. inspect existing interfaces;
+3. add or update a test first;
+4. implement the smallest coherent change;
+5. run focused tests;
+6. run the complete suite;
+7. report modified files, commands, and results.
 
 ---
 
-## 16. Definition of done
+## 14. Definition of done
 
-A TDV-QSM implementation is complete only when:
+The implementation is complete only when:
 
-- the forward model is exactly documented;
-- \(A\) and \(A^{H}\) pass the adjoint test;
-- the network outputs a scalar energy per sample;
-- the energy gradient has the same shape as \(\chi\);
-- the semi-implicit equation is solved to the required tolerance;
-- gradients reach all model parameters and \(T\);
-- the analysis kernel remains zero mean;
-- a tiny synthetic problem can be overfit;
-- units, axes, \(B_0\), voxel size, masks, and susceptibility reference are explicit;
-- every deviation from this specification is documented.
+- the physical model and units are documented;
+- \(A\) and \(A^H\) pass the adjoint test;
+- TDV outputs one scalar energy per sample;
+- the force is exactly \(\nabla_\chi R_\theta\);
+- the reconstruction uses explicit Euler;
+- TDV convolutions run under float16 autocast;
+- physics, FFT, state, reductions, and loss remain float32;
+- `GradScaler` is enabled on CUDA;
+- \(K\) remains zero mean;
+- all parameters and \(T\) receive finite gradients;
+- NRMSE is used identically for training and evaluation;
+- the data-consistency residual is exactly \(W(A\chi-b)\);
+- the explicit physical gradient is exactly \(A^H W^H W(A\chi-b)\);
+- AMP agrees reasonably with the float32 reference;
+- tiny-overfit passes;
+- no NaN or Inf occurs;
+- every deviation from this specification is explicitly documented.
