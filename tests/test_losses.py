@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from tdv_qsm.losses import nrmse, weighted_data_consistency_loss
+from tdv_qsm.losses import mask_and_reference, nrmse, weighted_data_consistency_loss
 from tdv_qsm.operators.dipole import DipoleOperator3D, build_dipole_kernel
 
 
@@ -36,3 +36,16 @@ def test_weighted_data_consistency_is_exact_w_times_residual() -> None:
     bad[..., 0, 0, 0] = float("nan")
     with pytest.raises(ValueError, match="finite"):
         weighted_data_consistency_loss(chi, local_field, bad, operator)
+
+
+def test_mask_and_reference_is_explicit_and_per_sample() -> None:
+    value = torch.tensor([[[[[1.0, 3.0]]]], [[[[2.0, 6.0]]]]])
+    mask = torch.ones_like(value)
+    torch.testing.assert_close(
+        mask_and_reference(value, mask, convention="already_referenced"), value
+    )
+    referenced = mask_and_reference(value, mask, convention="masked_mean_zero")
+    expected = torch.tensor([[[[[-1.0, 1.0]]]], [[[[-2.0, 2.0]]]]])
+    torch.testing.assert_close(referenced, expected)
+    with pytest.raises(ValueError, match="convention"):
+        mask_and_reference(value, mask, convention="implicit")

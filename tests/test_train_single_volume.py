@@ -48,11 +48,8 @@ def test_tiny_training_writes_metrics_and_reconstruction(tmp_path) -> None:
     assert all(math.isfinite(record["data_consistency_value"]) for record in history)
     assert all(math.isfinite(record["regularization_energy"]) for record in history)
     assert all(math.isfinite(record["regularization_energy_total"]) for record in history)
-    assert all(
-        record["regularization_energy"] <= record["regularization_energy_total"]
-        for record in history
-    )
-    assert model.raw_time.grad is not None
+    assert model.raw_T is not None and model.raw_T.grad is not None
+    assert model.raw_lambda is not None and model.raw_lambda.grad is not None
     assert (tmp_path / "history.csv").is_file()
     assert (tmp_path / "reconstruction.png").is_file()
 
@@ -70,6 +67,7 @@ def test_100_synthetic_training_steps_stay_finite_and_reach_every_parameter() ->
         maximum_time=0.1,
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    losses: list[float] = []
     for _ in range(100):
         optimizer.zero_grad(set_to_none=True)
         output = model(
@@ -81,12 +79,14 @@ def test_100_synthetic_training_steps_stay_finite_and_reach_every_parameter() ->
         )
         loss = nrmse(output.susceptibility, target)
         assert torch.isfinite(loss)
+        losses.append(float(loss.detach()))
         loss.backward()
         for name, parameter in model.named_parameters():
             assert parameter.grad is not None, name
             assert torch.isfinite(parameter.grad).all(), name
         optimizer.step()
-        model.regularizer.project_zero_mean_()
+        model.regularizer.project_analysis_kernel_()
+    assert min(losses[-10:]) < losses[0]
 
 
 def test_reconstruction_figure_uses_three_orientation_rows(tmp_path) -> None:

@@ -1,56 +1,76 @@
-# TDV-QSM physics and data contract
+# QSM physics and medical-data contract
 
-The field model is `b = A(chi) + eta`, with
-`A = F^H D F`.  Input tensors use `[B, 1, Z, Y, X]`; metadata is strictly
-`zyx`: `voxel_size_zyx=[vz, vy, vx]` and
-`b0_direction_zyx=[bz, by, bx]`.  Susceptibility and field units must agree
-with the user-supplied `phase_scale` in the signal simulation.  The source
-MATLAB arrays are assumed already in `zyx` order and no unit conversion is
-performed by the loader.
+QSM physics and medical-volume handling are project-specific extensions to the
+2-D source TDV repository.
 
-`DipoleOperator3D` runs float32/complex64 unitary FFTs and represents periodic
-Fourier boundary conditions.  It does not pad, crop, apply a mask, threshold
-the dipole (TKD), or materialize a dense convolution matrix.  Its `forward`
-and `adjoint` methods are separate interfaces, although a real dipole kernel
-makes their numerical action equal.
+## Axes, units, and boundaries
 
-The TDV CNN produces a signed, bias-free response `h_theta(chi)`, but the
-regularizer uses the nonnegative local potential
-`0.5 * h_theta(chi)^2`.  Consequently
-`R_theta(chi) = sum(mask * 0.5 * h_theta(chi)^2) >= 0` for every finite image
-and nonnegative mask, with `R_theta(0)=0`.  The square and spatial reduction
-are evaluated in float32 even when the CNN convolutions use CUDA float16 AMP.
-The final energy-head weights are initialized uniformly in
-`[-s/sqrt(features), s/sqrt(features)]`, with `s=0.2` by default.  This makes
-the initial quadratic energy `0.04` of the corresponding unit-scale-head
-energy while avoiding both the zero-gradient failure of an exactly zero head
-and subnormal float16 head responses.  The scale is stored in training
-configuration and checkpoints.
+Images and fields use `[B,1,Z,Y,X]`; voxel sizes and field directions use
+`[B,3]` in strict `zyx` order. `QSMOperator` normalizes each nonzero B0
+direction and supports a separate anisotropic voxel size per batch item.
 
-Training history compares like normalizations:
-`data_consistency_value = ||W(A chi-b)||^2/N` and
-`regularization_energy = R_theta(chi)/N`.  It additionally stores the summed
-`regularization_energy_total` for auditing.  Only the displayed/logged
-regularizer value is normalized; the explicit reconstruction continues to
-use the gradient of the summed scalar energy.
+The physical model is `b = F^H D F chi + eta`. It uses orthonormal float32 /
+complex64 FFTs and periodic boundaries. No pad, crop, mask, dipole threshold,
+TKD, or inverse is hidden in the operator. `forward` multiplies by `D` and
+`adjoint` by `D.conj()`.
 
-For the COSMOS runner the magnitude preprocessing rule is intentionally
-minimal and immutable:
+Field and susceptibility units are explicit sample metadata. The COSMOS
+simulation performs no unit conversion; its configured `phase_scale` must be
+consistent with those source units.
+
+The learned TDV convolutions use a different, explicit boundary rule:
+edge-inclusive symmetric extension and its exact transpose. Scale changes use
+learned convolution, separable binomial antialiasing, and stride two. Their
+adjoints recover requested odd and even shapes exactly.
+
+## Stored magnitude weight
+
+For the COSMOS runner, magnitude is treated as dimensionless and the rule is:
 
 ```text
-input magn: raw finite nonnegative magn values from magn.mat
-W:          sqrt(2) * magn
+W = sqrt(2) * raw_magnitude
+normalization = none
+clipping = none
+masking = none
+zero magnitude -> W = 0
+stored array = W, not sqrt(W)
 ```
 
-There is no magnitude normalization, clipping, mask multiplication, or
-spatial rescaling.  `W` is used both in the unrolled data gradient
-`A^H W^2 (A chi - b)` and, if enabled, in the optional data-consistency
-residual `W(A chi - b)`.  The brain mask is instead an explicit reconstruction
-state and susceptibility-evaluation mask.  `report.json` records this rule
-for every training run.
+Thus the data energy and its exact force are
 
-For every epoch, clean field `A(chi_gt)` is encoded in a complex magnitude
-signal, independent real/imaginary Gaussian noise is added at the configured
-SNR, and the noisy phase field is recovered.  The epoch seed is `seed+epoch`,
-so re-running an experiment is reproducible while its epochs retain distinct
-noise samples.
+\[
+D_W(\chi;b)=\tfrac12\|W(A\chi-b)\|_2^2,
+\qquad
+\nabla D_W=A^H W^2(A\chi-b).
+\]
+
+The two applications of `W` in the force are intentional. The brain mask is a
+separate state/evaluation choice. `lambda` controls the data force inside the
+unrolled dynamics; `beta_dc` controls an optional terminal loss. Neither
+changes the definition of `W`.
+
+## Full sample validation
+
+`QSMSample` contains:
+
+```text
+local_field, susceptibility, brain_mask, magnitude_weight, initial [1,Z,Y,X] float32
+voxel_size_zyx, b0_direction_zyx                              [3] float32
+subject_id, field_unit, susceptibility_unit                   explicit strings
+reference_convention, processing_version                     explicit strings
+```
+
+Validation rejects nonfinite values, negative weights, empty/negative masks,
+nonpositive voxel sizes, nonnormalized B0, mismatched shapes, inconsistent
+optional affines, contact/path-like subject IDs, and subjects duplicated across
+splits. The frozen sample record prevents accidental reassignment of the
+processing version.
+
+The `reference_convention` must be acted on before NRMSE. The provided helper
+supports `already_referenced` (mask only) and `masked_mean_zero` (independent
+per-sample in-mask mean subtraction followed by masking). The same NRMSE
+implementation is used for optimization and reporting.
+
+Subject splitting precedes patch extraction. Physical QSM updates should use
+whole volumes because the dipole operator is global. Patch-based work requires
+globally generated local fields plus a documented halo/crop boundary policy.

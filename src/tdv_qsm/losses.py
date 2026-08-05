@@ -7,6 +7,43 @@ import torch
 from tdv_qsm.operators.dipole import DipoleOperator3D
 
 
+def mask_and_reference(
+    value: torch.Tensor,
+    brain_mask: torch.Tensor,
+    *,
+    convention: str,
+) -> torch.Tensor:
+    """Apply an explicit susceptibility reference and brain mask.
+
+    ``already_referenced`` preserves supplied susceptibility values and only
+    masks them.  ``masked_mean_zero`` independently subtracts each sample's
+    in-mask mean before masking.  No implicit convention is selected.
+    """
+
+    if value.shape != brain_mask.shape or value.ndim < 2:
+        raise ValueError("value and brain_mask must have identical batched shapes.")
+    value = value.float()
+    mask = brain_mask.float()
+    if not torch.isfinite(value).all() or not torch.isfinite(mask).all():
+        raise ValueError("value and brain_mask must be finite.")
+    if torch.any(mask < 0.0):
+        raise ValueError("brain_mask must be nonnegative.")
+    count = mask.flatten(1).sum(dim=1)
+    if torch.any(count <= 0.0):
+        raise ValueError("brain_mask must be nonempty for every sample.")
+    if convention == "already_referenced":
+        referenced = value
+    elif convention == "masked_mean_zero":
+        mean = (value * mask).flatten(1).sum(dim=1) / count
+        reshape = (value.shape[0],) + (1,) * (value.ndim - 1)
+        referenced = value - mean.reshape(reshape)
+    else:
+        raise ValueError(
+            "reference convention must be 'already_referenced' or 'masked_mean_zero'."
+        )
+    return referenced * mask
+
+
 def nrmse(x_pred: torch.Tensor, x_true: torch.Tensor, *, eps: float = 1e-8) -> torch.Tensor:
     """Mean of per-sample normalized root mean squared errors."""
 
@@ -49,6 +86,8 @@ def weighted_data_consistency_loss(
             field_mask = torch.broadcast_to(field_mask.float(), local_field.shape)
         except RuntimeError as error:
             raise ValueError("field_mask must broadcast to local_field.") from error
+        if not torch.isfinite(field_mask).all() or torch.any(field_mask < 0.0):
+            raise ValueError("field_mask must be finite and nonnegative.")
         weighted_residual = weighted_residual * field_mask
         voxel_count = field_mask.flatten(1).sum(dim=1).clamp_min(1.0)
     else:

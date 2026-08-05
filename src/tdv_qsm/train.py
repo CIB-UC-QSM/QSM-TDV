@@ -3,7 +3,8 @@
 The runner is deliberately a same-volume overfit diagnostic, not a claim of
 cross-subject generalization.  It regenerates one independent complex-noise
 realization per epoch and uses the exact configured field weight
-``W = sqrt(2) * magn`` (with no mask folded into W).
+``W = sqrt(2) * magn`` (with no mask folded into W).  Three-dimensional QSM,
+medical-volume loading, NRMSE, and CUDA AMP are project extensions to TDV.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ import numpy as np
 import torch
 from scipy.io import loadmat
 
-from tdv_qsm.losses import nrmse, weighted_data_consistency_loss
+from tdv_qsm.losses import mask_and_reference, nrmse, weighted_data_consistency_loss
 from tdv_qsm.models.energy import TDVEnergy3D
 from tdv_qsm.models.explicit_tdv import ExplicitTDVQSM3D
 from tdv_qsm.operators.dipole import DipoleOperator3D, build_dipole_kernel
@@ -49,6 +50,13 @@ class TrainingConfig:
     macro_blocks: int = 1
     num_steps: int = 1
     maximum_time: float = 0.25
+    maximum_lambda: float = 1.0
+    initial_raw_T: float = 2.0
+    initial_raw_lambda: float = 0.0
+    mask_state_each_step: bool = True
+    checkpoint_force: bool = False
+    use_amp: bool = True
+    reference_convention: str = "already_referenced"
     regularizer_head_initialization_scale: float = 0.2
     phase_scale: float = 1.0
     voxel_size_zyx: tuple[float, float, float] = (1.0, 1.0, 1.0)
@@ -61,10 +69,12 @@ class TrainingConfig:
             raise ValueError("gradient norm must be positive and DC weight nonnegative.")
         if self.features < 1 or self.macro_blocks < 1 or self.num_steps < 1:
             raise ValueError("features, macro_blocks, and num_steps must be positive.")
-        if self.maximum_time <= 0.0 or self.phase_scale <= 0.0:
-            raise ValueError("maximum_time and phase_scale must be positive.")
+        if self.maximum_time <= 0.0 or self.maximum_lambda <= 0.0 or self.phase_scale <= 0.0:
+            raise ValueError("maximum_time, maximum_lambda, and phase_scale must be positive.")
         if self.regularizer_head_initialization_scale <= 0.0:
             raise ValueError("regularizer_head_initialization_scale must be positive.")
+        if self.reference_convention not in ("already_referenced", "masked_mean_zero"):
+            raise ValueError("Unsupported susceptibility reference_convention.")
 
 
 def _pyplot():
@@ -173,7 +183,12 @@ def load_single_volume(location: Path, device: torch.device) -> SingleVolume:
 
 
 def magnitude_weight(magnitude: torch.Tensor) -> torch.Tensor:
-    """The prescribed, documented weight transformation: ``W=sqrt(2)*magn``."""
+    """Return the stored diagonal ``W=sqrt(2)*magn`` (not ``sqrt(W)``).
+
+    Input magnitudes are treated as dimensionless, are not normalized or
+    clipped, and are not multiplied by a mask.  Zero magnitude maps to zero
+    weight and therefore removes that residual's data-term contribution.
+    """
 
     weight = math.sqrt(2.0) * magnitude.float()
     if not torch.isfinite(weight).all() or torch.any(weight < 0.0):
@@ -394,14 +409,21 @@ def train_single_volume(
     )
     operator = DipoleOperator3D(kernel)
     regularizer = TDVEnergy3D(
-        features=config.features,
-        macro_blocks=config.macro_blocks,
+        num_features=config.features,
+        num_macro_blocks=config.macro_blocks,
+        use_amp=config.use_amp,
         energy_head_initialization_scale=config.regularizer_head_initialization_scale,
     ).to(device)
     model = ExplicitTDVQSM3D(
         regularizer,
+        operator,
         num_steps=config.num_steps,
         maximum_time=config.maximum_time,
+        maximum_lambda=config.maximum_lambda,
+        initial_raw_T=config.initial_raw_T,
+        initial_raw_lambda=config.initial_raw_lambda,
+        mask_state_each_step=config.mask_state_each_step,
+        checkpoint_force=config.checkpoint_force,
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
@@ -424,9 +446,17 @@ def train_single_volume(
         )
         initial = initial_backprojection(local_field, weight, sample.brain_mask, operator)
         optimizer.zero_grad(set_to_none=True)
-        output = model(local_field, sample.brain_mask, kernel, weight, initial)
-        x_pred = output.susceptibility.float() * sample.brain_mask.float()
-        x_true = sample.susceptibility.float() * sample.brain_mask.float()
+        output = model(local_field, sample.brain_mask, None, weight, initial)
+        x_pred = mask_and_reference(
+            output.susceptibility,
+            sample.brain_mask,
+            convention=config.reference_convention,
+        )
+        x_true = mask_and_reference(
+            sample.susceptibility,
+            sample.brain_mask,
+            convention=config.reference_convention,
+        )
         loss_nrmse = nrmse(x_pred, x_true)
         loss = loss_nrmse
         if config.data_consistency_weight > 0.0:
@@ -448,11 +478,13 @@ def train_single_volume(
                 )
         with torch.no_grad():
             regularization_energy_per_sample = model.regularizer.energy(
-                output.susceptibility.detach(),
-                sample.brain_mask,
+                output.susceptibility.detach()
             )
-            regularization_voxel_count = (
-                sample.brain_mask.float().flatten(1).sum(dim=1).clamp_min(1.0)
+            regularization_voxel_count = torch.full(
+                (output.susceptibility.shape[0],),
+                output.susceptibility[0, 0].numel(),
+                dtype=torch.float32,
+                device=device,
             )
             regularization_energy = (
                 regularization_energy_per_sample / regularization_voxel_count
@@ -470,7 +502,7 @@ def train_single_volume(
         gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_gradient_norm)
         scaler.step(optimizer)
         scaler.update()
-        model.regularizer.project_zero_mean_()
+        model.regularizer.project_analysis_kernel_()
 
         record = {
             "epoch": float(epoch + 1),
@@ -480,7 +512,10 @@ def train_single_volume(
             "regularization_energy": float(regularization_energy.detach().cpu()),
             "regularization_energy_total": float(regularization_energy_total.detach().cpu()),
             "time": float(output.time.detach().cpu()),
-            "step_size": float(output.step_size.detach().cpu()),
+            "lambda": float(output.data_coefficient.detach().cpu()),
+            "regularizer_step": float(output.regularizer_step.detach().cpu()),
+            "data_step": float(output.data_step.detach().cpu()),
+            "step_size": float(output.regularizer_step.detach().cpu()),
             "data_gradient_norm": float(output.data_gradient_norm.mean().cpu()),
             "regularizer_gradient_norm": float(output.regularizer_gradient_norm.mean().cpu()),
             "state_norm": float(output.state_norm.mean().cpu()),
@@ -491,17 +526,28 @@ def train_single_volume(
         print(
             f"epoch {epoch + 1:04d}/{config.epochs}: "
             f"loss={record['loss']:.6e} nrmse={record['nrmse']:.6e} "
-            f"T={record['time']:.3e} tau={record['step_size']:.3e}",
+            f"T={record['time']:.3e} lambda={record['lambda']:.3e} "
+            f"tau_R={record['regularizer_step']:.3e} tau_D={record['data_step']:.3e}",
             flush=True,
         )
 
     assert last_initial is not None and last_local_field is not None
     model.eval()
-    # Do not use no_grad here: the reconstruction itself evaluates ∇_chi R.
-    final_output = model(last_local_field, sample.brain_mask, kernel, weight, last_initial)
-    final_prediction = final_output.susceptibility * sample.brain_mask.float()
-    final_truth = sample.susceptibility * sample.brain_mask.float()
-    final_nrmse = nrmse(final_prediction, final_truth)
+    # The production force is an explicit transpose chain, so evaluation no
+    # longer needs to build an input-autograd graph.
+    with torch.no_grad():
+        final_output = model(last_local_field, sample.brain_mask, None, weight, last_initial)
+        final_prediction = mask_and_reference(
+            final_output.susceptibility,
+            sample.brain_mask,
+            convention=config.reference_convention,
+        )
+        final_truth = mask_and_reference(
+            sample.susceptibility,
+            sample.brain_mask,
+            convention=config.reference_convention,
+        )
+        final_nrmse = nrmse(final_prediction, final_truth)
     _finite_or_raise("final NRMSE", final_nrmse)
     _save_history(history, output_dir)
     save_reconstruction_figure(
@@ -518,7 +564,7 @@ def train_single_volume(
             "config": asdict(config),
             "final_nrmse": float(final_nrmse.detach().cpu()),
             "weight_rule": "W = sqrt(2) * magn",
-            "regularizer_energy_rule": "R_theta(chi) = sum(mask * 0.5 * h_theta(chi)^2) >= 0",
+            "regularizer_energy_rule": "R_theta(chi) = sum(T_theta(chi) / num_features)",
         },
         output_dir / "checkpoint.pt",
     )
@@ -527,9 +573,11 @@ def train_single_volume(
         "physical_model": "b = F^H D F chi + eta; periodic unitary FFT, no padding/cropping/TKD",
         "volume_layout": "[B, 1, Z, Y, X]",
         "metadata_order": "zyx",
-        "weight_rule": "W = sqrt(2) * magn; raw input magn, no normalization, clipping, or mask multiplication",
-        "regularizer_energy_rule": "R_theta(chi) = sum(mask * 0.5 * h_theta(chi)^2) >= 0",
-        "history_energy_normalization": "data_consistency_value = ||W(Achi-b)||^2/N; regularization_energy = R_theta(chi)/N",
+        "weight_rule": "Stored W (not sqrt(W)) = sqrt(2) * dimensionless magn; no normalization, clipping, or mask multiplication; zero magn gives W=0",
+        "regularizer_energy_rule": "R_theta(chi) = sum(T_theta(chi) / num_features)",
+        "history_energy_normalization": "data_consistency_value = ||W(Achi-b)||^2/N_mask; regularization_energy = R_theta(chi)/N_volume",
+        "source_provenance": "TDV energy/manual-force design follows VLOGroup/tdv; 3-D, QSM, magnitude W, NRMSE, AMP, and medical-volume handling are project extensions",
+        "susceptibility_reference_convention": config.reference_convention,
         "noise_rule": "Per epoch complex Gaussian signal noise; real/imag std = mean(magn inside brain_mask) / SNR",
         "image_display_range": [-0.1, 0.1],
         "final_nrmse": float(final_nrmse.detach().cpu()),
@@ -551,6 +599,13 @@ def _configuration_from_args(arguments: argparse.Namespace) -> TrainingConfig:
         macro_blocks=arguments.macro_blocks,
         num_steps=arguments.steps,
         maximum_time=arguments.maximum_time,
+        maximum_lambda=arguments.maximum_lambda,
+        initial_raw_T=arguments.initial_raw_T,
+        initial_raw_lambda=arguments.initial_raw_lambda,
+        mask_state_each_step=not arguments.no_step_mask,
+        checkpoint_force=arguments.checkpoint_force,
+        use_amp=not arguments.no_amp,
+        reference_convention=arguments.reference_convention,
         regularizer_head_initialization_scale=arguments.regularizer_head_initialization_scale,
         phase_scale=arguments.phase_scale,
         voxel_size_zyx=tuple(arguments.voxel_size),
@@ -577,6 +632,17 @@ def main() -> None:
     parser.add_argument("--macro-blocks", type=int, default=1)
     parser.add_argument("--steps", type=int, default=1)
     parser.add_argument("--maximum-time", type=float, default=0.25)
+    parser.add_argument("--maximum-lambda", type=float, default=1.0)
+    parser.add_argument("--initial-raw-T", type=float, default=2.0)
+    parser.add_argument("--initial-raw-lambda", type=float, default=0.0)
+    parser.add_argument("--no-step-mask", action="store_true")
+    parser.add_argument("--checkpoint-force", action="store_true")
+    parser.add_argument("--no-amp", action="store_true")
+    parser.add_argument(
+        "--reference-convention",
+        choices=("already_referenced", "masked_mean_zero"),
+        default="already_referenced",
+    )
     parser.add_argument(
         "--regularizer-head-initialization-scale",
         type=float,
