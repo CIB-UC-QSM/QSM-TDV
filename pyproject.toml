@@ -16,6 +16,7 @@ dev = ["pytest>=8.0"]
 
 [project.scripts]
 tdv-qsm-train = "tdv_qsm.train:main"
+tdv-qsm-gradient-baseline = "tdv_qsm.gradient_baseline:main"
 
 [build-system]
 requires = ["setuptools>=68"]
