@@ -232,7 +232,7 @@ def magnitude_weight(magnitude: torch.Tensor) -> torch.Tensor:
     weight and therefore removes that residual's data-term contribution.
     """
 
-    weight = math.sqrt(2.0) * magnitude.float()
+    weight = magnitude.float()
     if not torch.isfinite(weight).all() or torch.any(weight < 0.0):
         raise ValueError("magn must be finite and nonnegative.")
     return weight

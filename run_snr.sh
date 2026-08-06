@@ -4,7 +4,7 @@
 set -e
 
 # Definir la lista de valores de SNR
-snr_values=(70 100 150)
+snr_values=(70) # 100 150)
 
 # Iterar sobre cada valor de SNR
 for snr in "${snr_values[@]}"; do
@@ -17,8 +17,8 @@ for snr in "${snr_values[@]}"; do
     --output-dir runs/cosmos-snr${snr}-fix \
     --epochs 1000 \
     --snr "$snr" \
-    --features 4 \
-    --steps 30 \
+    --features 1 \
+    --steps 100 \
     --maximum-time 0.25 \
     --learning-rate 1e-4
 
