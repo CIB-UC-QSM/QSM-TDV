@@ -108,3 +108,4 @@ def test_baseline_evaluation_writes_reconstruction_metrics_and_conventions(tmp_p
     assert report["regularizer"] == "none"
     assert report["data_gradient"] == "A^H W^2 (A chi - b)"
     assert report["selection_rule"] == "fixed iteration count; ground truth is not used for stopping"
+    assert report["weight_rule"].startswith("Stored W (not sqrt(W)) = dimensionless magn")

@@ -69,7 +69,7 @@ and the explicit branch is
 
 \[
 \chi_{s+1}=\chi_s-\frac{T}{S}\nabla R_\theta(\chi_s)
--\frac{\lambda}{S}g_D.
+-\lambda g_D.
 \]
 
 `T` and `lambda` have independent learned bounded or fixed modes. State
@@ -88,7 +88,7 @@ clipping: none
 masking inside W: none
 zero magnitude: stored W is zero
 stored quantity: W itself, not sqrt(W)
-W: sqrt(2) * magn
+W: magn
 ```
 
 The brain mask is separate from `W`. Training and optional terminal data
@@ -134,6 +134,7 @@ uv run tdv-qsm-train \
   --steps 10 \
   --maximum-time 0.25 \
   --maximum-lambda 1.0 \
+  --augmentation \
   --learning-rate 1e-4
 ```
 
@@ -141,6 +142,17 @@ The run writes `history.csv`, `history.png`, `reconstruction.png`,
 `checkpoint.pt`, and `report.json`. The optional terminal loss is
 `NRMSE + beta_dc * ||W(A chi-b)||^2/N`; `beta_dc` is independent of the
 dynamics coefficient `lambda` and spatial reliability `W`.
+
+Optional `--augmentation` affects training epochs only. Each epoch samples a
+random permutation of the `zyx` spatial dimensions and independent axis
+mirrors, applying the same transform to susceptibility, magnitude, and mask.
+The configured voxel size and \(B_0\) direction remain unchanged. After
+complex noise is applied, there is a 50% chance of selecting one to three
+voxels whose full `3x3x3` neighborhood is inside the mask and multiplying
+their phase by an independent value sampled uniformly from `[5,10]`; the mask
+is unchanged.
+Final evaluation always uses the original geometry and contains no injected
+outliers.
 
 Before optimization begins, the training runner prints the complete model
 architecture followed by the number of microblocks, macroblocks, learned
@@ -194,8 +206,8 @@ number of explicit reconstruction iterations:
 By default, the evaluator loads the final per-step model weights directly from
 `report.json` at `taus.regularizer` and `taus.data`. It does not reconstruct
 them from raw checkpoint parameters. An explicit `taus` argument overrides
-the report values and is ordered as `tau_R` followed by `tau_D`. The Python
-API is:
+the report values and is ordered as `tau_R` followed by `tau_D`, where
+`tau_R = T/S` and `tau_D = lambda`. The Python API is:
 
 ```python
 evaluate_learned_regularizers(
@@ -228,9 +240,9 @@ initial.mat present: use the supplied initial state
 initial.mat absent: use the masked weighted normal backprojection
 ```
 
-The raw-`magn` evaluation rule and its exact `mask` fallback are specific to
-this evaluator. They do not replace the training runner's documented
-`W = sqrt(2) * magn` preprocessing rule.
+The raw-`magn` rule is identical to the training runner's `W = magn`
+preprocessing rule. Only the exact `mask` fallback when `magn.mat` is absent is
+specific to this evaluator.
 
 At iteration `s`, `tol_update` is
 

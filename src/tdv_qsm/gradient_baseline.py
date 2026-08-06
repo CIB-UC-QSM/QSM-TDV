@@ -367,7 +367,7 @@ def evaluate_gradient_baseline(
         "initialization": "masked A^H W^2 b backprojection",
         "step_size_rule": step_size_rule,
         "physical_model": "b = F^H D F chi + eta; periodic unitary FFT, no padding/cropping/TKD",
-        "weight_rule": "Stored W (not sqrt(W)) = sqrt(2) * dimensionless magn; no normalization, clipping, or mask multiplication; zero magn gives W=0",
+        "weight_rule": "Stored W (not sqrt(W)) = dimensionless magn; no normalization, clipping, or mask multiplication; zero magn gives W=0",
         "susceptibility_reference_convention": config.reference_convention,
         "noise_rule": "One complex Gaussian signal-noise realization; real/imag std = mean(magn inside brain_mask) / SNR",
         "source_provenance": "The baseline uses project-specific 3-D QSM physics and medical-volume handling; it contains no TDV regularizer",

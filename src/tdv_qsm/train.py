@@ -3,7 +3,7 @@
 The runner is deliberately a same-volume overfit diagnostic, not a claim of
 cross-subject generalization.  It regenerates one independent complex-noise
 realization per epoch and uses the exact configured field weight
-``W = sqrt(2) * magn`` (with no mask folded into W).  Three-dimensional QSM,
+``W = magn`` (with no mask folded into W).  Three-dimensional QSM,
 medical-volume loading, NRMSE, and CUDA AMP are project extensions to TDV.
 """
 
@@ -20,6 +20,7 @@ from typing import Any, Mapping
 import numpy as np
 import torch
 from scipy.io import loadmat
+from torch.nn import functional as F
 
 from tdv_qsm.losses import mask_and_reference, nrmse, weighted_data_consistency_loss
 from tdv_qsm.models.blocks import MacroBlock3D, MicroBlock3D
@@ -36,6 +37,93 @@ class SingleVolume:
     susceptibility: torch.Tensor
     magnitude: torch.Tensor
     brain_mask: torch.Tensor
+
+
+def apply_geometry_augmentation(
+    sample: SingleVolume,
+    *,
+    permutation_zyx: tuple[int, int, int],
+    mirrored_zyx: tuple[bool, bool, bool],
+) -> SingleVolume:
+    if sorted(permutation_zyx) != [0, 1, 2]:
+        raise ValueError("permutation_zyx must be a permutation of (0, 1, 2).")
+    if len(mirrored_zyx) != 3:
+        raise ValueError("mirrored_zyx must contain three flags.")
+    tensor_order = (0, 1, *(2 + axis for axis in permutation_zyx))
+    flip_dimensions = tuple(
+        2 + axis for axis, mirrored in enumerate(mirrored_zyx) if mirrored
+    )
+
+    def transform(value: torch.Tensor) -> torch.Tensor:
+        transformed = value.permute(tensor_order)
+        if flip_dimensions:
+            transformed = transformed.flip(flip_dimensions)
+        return transformed.contiguous()
+
+    return SingleVolume(
+        susceptibility=transform(sample.susceptibility),
+        magnitude=transform(sample.magnitude),
+        brain_mask=transform(sample.brain_mask),
+    )
+
+
+def random_geometry_augmentation(
+    sample: SingleVolume,
+    *,
+    generator: torch.Generator,
+) -> SingleVolume:
+    permutation = tuple(int(axis) for axis in torch.randperm(3, generator=generator))
+    mirrored = tuple(
+        bool(value) for value in (torch.rand(3, generator=generator) < 0.5)
+    )
+    return apply_geometry_augmentation(
+        sample,
+        permutation_zyx=permutation,
+        mirrored_zyx=mirrored,
+    )
+
+
+def add_random_phase_outliers(
+    local_field: torch.Tensor,
+    brain_mask: torch.Tensor,
+    *,
+    generator: torch.Generator,
+    probability: float = 0.5,
+) -> tuple[torch.Tensor, int]:
+    if local_field.shape != brain_mask.shape or local_field.ndim != 5:
+        raise ValueError("local_field and brain_mask must have matching 5-D shapes.")
+    if not math.isfinite(probability) or not 0.0 <= probability <= 1.0:
+        raise ValueError("probability must be finite and between zero and one.")
+    augmented = local_field.clone()
+    if float(torch.rand((), generator=generator)) >= probability:
+        return augmented, 0
+    binary_mask = (brain_mask > 0.0).float()
+    neighborhood = F.conv3d(
+        binary_mask,
+        torch.ones(
+            (1, 1, 3, 3, 3),
+            dtype=torch.float32,
+            device=brain_mask.device,
+        ),
+        padding=1,
+    )
+    eligible = torch.nonzero(
+        ((neighborhood == 27.0) & (binary_mask > 0.0)).flatten(),
+        as_tuple=False,
+    ).flatten()
+    if eligible.numel() == 0:
+        return augmented, 0
+    maximum_count = min(3, eligible.numel())
+    count = int(torch.randint(1, maximum_count + 1, (1,), generator=generator))
+    choice = torch.randperm(eligible.numel(), generator=generator)[:count]
+    selected = eligible[choice.to(device=eligible.device)]
+    factors = 5.0 + 5.0 * torch.rand(count, generator=generator)
+    flattened = augmented.flatten()
+    flattened[selected] = flattened[selected] * factors.to(
+        device=flattened.device,
+        dtype=flattened.dtype,
+    )
+    return augmented, count
 
 
 @dataclass(frozen=True)
@@ -98,6 +186,7 @@ class TrainingConfig:
     mask_state_each_step: bool = True
     checkpoint_force: bool = False
     use_amp: bool = True
+    augmentation: bool = False
     reference_convention: str = "already_referenced"
     regularizer_head_initialization_scale: float = 0.2
     phase_scale: float = 1.0
@@ -473,34 +562,67 @@ def train_single_volume(
     print_model_architecture(model)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
-    weight = magnitude_weight(sample.magnitude)
+    evaluation_weight = magnitude_weight(sample.magnitude)
     history: list[dict[str, float]] = []
-    last_initial: torch.Tensor | None = None
-    last_local_field: torch.Tensor | None = None
 
     model.train()
     for epoch in range(config.epochs):
-        # Different deterministic seeds guarantee a distinct random draw each epoch.
+        training_sample = sample
+        if config.augmentation:
+            geometry_generator = torch.Generator().manual_seed(config.seed + epoch)
+            training_sample = random_geometry_augmentation(
+                sample,
+                generator=geometry_generator,
+            )
+        training_kernel = build_dipole_kernel(
+            training_sample.susceptibility.shape[-3:],
+            config.voxel_size_zyx,
+            config.b0_direction_zyx,
+            device=device,
+        )
+        training_operator = DipoleOperator3D(training_kernel)
+        training_weight = magnitude_weight(training_sample.magnitude)
         local_field = simulate_noisy_local_field(
-            sample.susceptibility,
-            sample.magnitude,
-            sample.brain_mask,
-            operator,
+            training_sample.susceptibility,
+            training_sample.magnitude,
+            training_sample.brain_mask,
+            training_operator,
             snr=config.snr,
             phase_scale=config.phase_scale,
             seed=config.seed + epoch,
         )
-        initial = initial_backprojection(local_field, weight, sample.brain_mask, operator)
+        phase_outlier_count = 0
+        if config.augmentation:
+            outlier_generator = torch.Generator().manual_seed(
+                config.seed + config.epochs + epoch
+            )
+            local_field, phase_outlier_count = add_random_phase_outliers(
+                local_field,
+                training_sample.brain_mask,
+                generator=outlier_generator,
+            )
+        initial = initial_backprojection(
+            local_field,
+            training_weight,
+            training_sample.brain_mask,
+            training_operator,
+        )
         optimizer.zero_grad(set_to_none=True)
-        output = model(local_field, sample.brain_mask, None, weight, initial)
+        output = model(
+            local_field,
+            training_sample.brain_mask,
+            training_kernel,
+            training_weight,
+            initial,
+        )
         x_pred = mask_and_reference(
             output.susceptibility,
-            sample.brain_mask,
+            training_sample.brain_mask,
             convention=config.reference_convention,
         )
         x_true = mask_and_reference(
-            sample.susceptibility,
-            sample.brain_mask,
+            training_sample.susceptibility,
+            training_sample.brain_mask,
             convention=config.reference_convention,
         )
         loss_nrmse = nrmse(x_pred, x_true)
@@ -509,18 +631,18 @@ def train_single_volume(
             data_consistency_value = weighted_data_consistency_loss(
                 output.susceptibility,
                 local_field,
-                weight,
-                operator,
-                field_mask=sample.brain_mask,
+                training_weight,
+                training_operator,
+                field_mask=training_sample.brain_mask,
             )
         else:
             with torch.no_grad():
                 data_consistency_value = weighted_data_consistency_loss(
                     output.susceptibility.detach(),
                     local_field,
-                    weight,
-                    operator,
-                    field_mask=sample.brain_mask,
+                    training_weight,
+                    training_operator,
+                    field_mask=training_sample.brain_mask,
                 )
         with torch.no_grad():
             regularization_energy_per_sample = model.regularizer.energy(
@@ -566,23 +688,42 @@ def train_single_volume(
             "regularizer_gradient_norm": float(output.regularizer_gradient_norm.mean().cpu()),
             "state_norm": float(output.state_norm.mean().cpu()),
             "parameter_gradient_norm": float(gradient_norm.detach().cpu()),
+            "phase_outlier_count": float(phase_outlier_count),
         }
         history.append(record)
-        last_initial, last_local_field = initial.detach(), local_field.detach()
         print(
             f"epoch {epoch + 1:04d}/{config.epochs}: "
             f"loss={record['loss']:.6e} nrmse={record['nrmse']:.6e} "
             f"T={record['time']:.3e} lambda={record['lambda']:.3e} "
-            f"tau_R={record['regularizer_step']:.3e} tau_D={record['data_step']:.3e}",
+            f"tau_R={record['regularizer_step']:.3e} tau_D={record['data_step']:.3e} "
+            f"outliers={phase_outlier_count}",
             flush=True,
         )
 
-    assert last_initial is not None and last_local_field is not None
     model.eval()
-    # The production force is an explicit transpose chain, so evaluation no
-    # longer needs to build an input-autograd graph.
+    evaluation_local_field = simulate_noisy_local_field(
+        sample.susceptibility,
+        sample.magnitude,
+        sample.brain_mask,
+        operator,
+        snr=config.snr,
+        phase_scale=config.phase_scale,
+        seed=config.seed + config.epochs - 1,
+    )
+    evaluation_initial = initial_backprojection(
+        evaluation_local_field,
+        evaluation_weight,
+        sample.brain_mask,
+        operator,
+    )
     with torch.no_grad():
-        final_output = model(last_local_field, sample.brain_mask, None, weight, last_initial)
+        final_output = model(
+            evaluation_local_field,
+            sample.brain_mask,
+            None,
+            evaluation_weight,
+            evaluation_initial,
+        )
         final_prediction = mask_and_reference(
             final_output.susceptibility,
             sample.brain_mask,
@@ -597,7 +738,7 @@ def train_single_volume(
     _finite_or_raise("final NRMSE", final_nrmse)
     _save_history(history, output_dir)
     save_reconstruction_figure(
-        last_initial,
+        evaluation_initial,
         final_prediction,
         final_truth,
         output_dir / "reconstruction.png",
@@ -609,7 +750,8 @@ def train_single_volume(
             "optimizer_state_dict": optimizer.state_dict(),
             "config": asdict(config),
             "final_nrmse": float(final_nrmse.detach().cpu()),
-            "weight_rule": "W = sqrt(2) * magn",
+            "weight_rule": "W = magn",
+            "explicit_update_rule": "chi_(s+1) = chi_s - (T/S) * g_R - lambda * g_D",
             "regularizer_energy_rule": "R_theta(chi) = sum(T_theta(chi) / num_features)",
         },
         output_dir / "checkpoint.pt",
@@ -619,12 +761,15 @@ def train_single_volume(
         "physical_model": "b = F^H D F chi + eta; periodic unitary FFT, no padding/cropping/TKD",
         "volume_layout": "[B, 1, Z, Y, X]",
         "metadata_order": "zyx",
-        "weight_rule": "Stored W (not sqrt(W)) = sqrt(2) * dimensionless magn; no normalization, clipping, or mask multiplication; zero magn gives W=0",
+        "weight_rule": "Stored W (not sqrt(W)) = dimensionless magn; no normalization, clipping, or mask multiplication; zero magn gives W=0",
+        "explicit_update_rule": "chi_(s+1) = chi_s - (T/S) * g_R - lambda * g_D",
         "regularizer_energy_rule": "R_theta(chi) = sum(T_theta(chi) / num_features)",
         "history_energy_normalization": "data_consistency_value = ||W(Achi-b)||^2/N_mask; regularization_energy = R_theta(chi)/N_volume",
         "source_provenance": "TDV energy/manual-force design follows VLOGroup/tdv; 3-D, QSM, magnitude W, NRMSE, AMP, and medical-volume handling are project extensions",
         "susceptibility_reference_convention": config.reference_convention,
         "noise_rule": "Per epoch complex Gaussian signal noise; real/imag std = mean(magn inside brain_mask) / SNR",
+        "augmentation_enabled": config.augmentation,
+        "augmentation_rule": "Training only: random spatial-axis permutation and mirroring applied coherently to chi, magn, and mask while voxel size and B0 direction remain fixed; after noise, 50% chance of scaling 1-3 interior-mask phase voxels by Uniform[5,10]; final evaluation is unaugmented",
         "image_display_range": [-0.1, 0.1],
         "final_nrmse": float(final_nrmse.detach().cpu()),
         "taus": {
@@ -655,6 +800,7 @@ def _configuration_from_args(arguments: argparse.Namespace) -> TrainingConfig:
         mask_state_each_step=not arguments.no_step_mask,
         checkpoint_force=arguments.checkpoint_force,
         use_amp=not arguments.no_amp,
+        augmentation=arguments.augmentation,
         reference_convention=arguments.reference_convention,
         regularizer_head_initialization_scale=arguments.regularizer_head_initialization_scale,
         phase_scale=arguments.phase_scale,
@@ -688,6 +834,7 @@ def main() -> None:
     parser.add_argument("--no-step-mask", action="store_true")
     parser.add_argument("--checkpoint-force", action="store_true")
     parser.add_argument("--no-amp", action="store_true")
+    parser.add_argument("--augmentation", action="store_true")
     parser.add_argument(
         "--reference-convention",
         choices=("already_referenced", "masked_mean_zero"),

@@ -15,12 +15,13 @@ for snr in "${snr_values[@]}"; do
   uv run tdv-qsm-train \
     --data /cosmos_data \
     --output-dir runs/cosmos-snr${snr}-fix \
-    --epochs 1000 \
+    --epochs 10 \
     --snr "$snr" \
     --features 1 \
-    --steps 100 \
+    --steps 5 \
     --maximum-time 0.25 \
-    --learning-rate 1e-4
+    --learning-rate 1e-4 \
+    --augmentation
 
   echo "Completado SNR = $snr"
   echo ""

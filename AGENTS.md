@@ -207,6 +207,11 @@ The preprocessing rule that constructs \(W\) from magnitude must specify:
 
 Do not silently modify this rule.
 
+For the COSMOS runners in this project, the immutable rule is \(W=\mathrm{magn}\):
+raw finite nonnegative dimensionless magnitude, with no normalization,
+clipping, or mask multiplication. Zero magnitude gives \(W=0\), and the stored
+quantity is \(W\), not \(\sqrt W\).
+
 ---
 
 ## 5. Source-faithful TDV energy
@@ -533,7 +538,7 @@ The explicit update is
 -
 \frac{T}{S}g_R^s
 -
-\frac{\lambda}{S}g_D^s.
+\lambda g_D^s.
 }
 \]
 
@@ -560,7 +565,7 @@ T = self.maximum_time * torch.sigmoid(self.raw_T)
 lam = self.maximum_lambda * torch.sigmoid(self.raw_lambda)
 
 regularizer_step = T.float() / self.num_steps
-data_step = lam.float() / self.num_steps
+data_step = lam.float()
 
 chi = initial.float()
 
@@ -812,6 +817,14 @@ Validation:
 
 Split subjects before patch extraction. Because the dipole operator is global, do not train physical QSM updates on isolated patches unless local fields were generated globally and the crop/halo policy is documented.
 
+Optional COSMOS augmentation is training-only. Apply every sampled spatial
+permutation and mirror identically to susceptibility, magnitude, and mask;
+keep the configured voxel size and \(B_0\) direction constant. After noise is
+applied, a separate 50% draw may multiply one to three distinct interior-mask
+phase voxels by independent factors from \([5,10]\). Interior means the complete
+\(3\times3\times3\) neighborhood lies inside the mask. Never alter the mask for
+phase outliers, and never apply either augmentation during final evaluation.
+
 ---
 
 ## 16. Mandatory tests
@@ -932,7 +945,7 @@ The implementation is complete only when:
 - \(K_1\) is zero-mean and norm-bounded;
 - QSM `A` and `A^H` pass the adjoint test;
 - the data force is exactly \(A^H W^H W(A\chi-b)\);
-- the explicit update uses separate \(T/S\) and \(\lambda/S\) coefficients;
+- the explicit update uses separate \(T/S\) and \(\lambda\) coefficients;
 - NRMSE is used consistently for training and evaluation;
 - float16 is limited to AMP-safe learned operations;
 - FFT, state updates, force outputs, reductions, and loss remain float32;

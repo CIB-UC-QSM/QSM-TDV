@@ -71,7 +71,9 @@ class ExplicitTDVQSM3D(nn.Module):
 
     The QSM operator, magnitude weights, 3-D state, masking, and float16 AMP
     are project extensions.  The explicit update keeps the source branch's
-    separate regularizer and data coefficients.
+    separate regularizer and data coefficients.  This project's step convention
+    applies ``T / S`` to the regularizer force and undivided ``lambda`` to the
+    data force at every iteration.
     """
 
     def __init__(
@@ -218,7 +220,7 @@ class ExplicitTDVQSM3D(nn.Module):
 
         total_time, data_coefficient = self.coefficients()
         regularizer_step = total_time.float() / self.num_steps
-        data_step = data_coefficient.float() #/ self.num_steps
+        data_step = data_coefficient.float()
         chi = initial.float()
         states: list[torch.Tensor] | None = [chi] if return_states else None
         data_norms: list[torch.Tensor] = []

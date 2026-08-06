@@ -28,7 +28,7 @@ adjoints recover requested odd and even shapes exactly.
 For the COSMOS runner, magnitude is treated as dimensionless and the rule is:
 
 ```text
-W = sqrt(2) * raw_magnitude
+W = raw_magnitude
 normalization = none
 clipping = none
 masking = none
@@ -48,6 +48,29 @@ The two applications of `W` in the force are intentional. The brain mask is a
 separate state/evaluation choice. `lambda` controls the data force inside the
 unrolled dynamics; `beta_dc` controls an optional terminal loss. Neither
 changes the definition of `W`.
+
+The explicit dynamics use
+
+\[
+\chi_{s+1}=\chi_s-\frac{T}{S}\nabla R_\theta(\chi_s)
+-\lambda A^H W^2(A\chi_s-b).
+\]
+
+Thus `T/S` is the regularizer step and `lambda` itself is the data step at
+every iteration. `lambda` is not divided by `S`.
+
+## Training-only COSMOS augmentation
+
+When enabled, COSMOS training samples a spatial-axis permutation and axis
+mirrors for every epoch. Susceptibility, magnitude, and mask receive the same
+transform. The configured voxel size and \(B_0\) direction remain fixed for
+every augmented geometry.
+
+After complex noise is converted to phase, a separate 50% draw controls phase
+outliers. On success, one to three distinct voxels with a complete in-mask
+`3x3x3` neighborhood are multiplied by independent `Uniform[5,10]` factors.
+The mask is never altered. Final evaluation regenerates the noisy field from
+the original geometry without geometric augmentation or outliers.
 
 ## Full sample validation
 

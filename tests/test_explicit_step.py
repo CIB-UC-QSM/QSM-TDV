@@ -37,8 +37,9 @@ def test_one_step_matches_separate_regularizer_and_weight_squared_data_coefficie
         data_force = operator.adjoint(
             weight.square() * (operator.forward(expected) - local_field)
         )
-        expected = expected - 0.1 * expected - 0.3 * data_force
+        expected = expected - 0.1 * expected - 0.6 * data_force
     torch.testing.assert_close(output.susceptibility, expected, atol=2e-6, rtol=2e-6)
+    torch.testing.assert_close(output.data_step, torch.tensor(0.6))
     assert output.states is not None and len(output.states) == 3
 
 
