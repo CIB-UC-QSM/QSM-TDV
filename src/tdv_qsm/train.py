@@ -190,9 +190,9 @@ def magnitude_weight(magnitude: torch.Tensor) -> torch.Tensor:
     weight and therefore removes that residual's data-term contribution.
     """
 
-    weight = math.sqrt(2.0) * magnitude.float()
+    weight = magnitude.float()
     if not torch.isfinite(weight).all() or torch.any(weight < 0.0):
-        raise ValueError("W = sqrt(2) * magn must be finite and nonnegative.")
+        raise ValueError("magn must be finite and nonnegative.")
     return weight
 
 
@@ -221,7 +221,7 @@ def simulate_noisy_local_field(
     in_mask = magnitude[brain_mask > 0.0]
     if in_mask.numel() == 0 or torch.all(in_mask == 0.0):
         raise ValueError("The brain mask must contain at least one positive magnitude voxel.")
-    noise_std = in_mask.mean().float() / float(snr)
+    noise_std = in_mask.max().float() / float(snr)
     generator = torch.Generator(device=susceptibility.device)
     generator.manual_seed(int(seed))
     real_noise = torch.randn(
@@ -237,9 +237,11 @@ def simulate_noisy_local_field(
         generator=generator,
     )
     phase = phase_scale * clean_field
-    signal = torch.polar(magnitude.float(), -phase.float())
+    scale = torch.pi / phase.abs().max()
+
+    signal = torch.polar(magnitude.float(), phase.float()*scale)
     noisy_signal = signal + torch.complex(noise_std * real_noise, noise_std * imag_noise)
-    return (-torch.angle(noisy_signal) / phase_scale).float() * brain_mask.float()
+    return (torch.angle(noisy_signal) / scale).float() * brain_mask.float()
 
 
 def initial_backprojection(
@@ -632,9 +634,9 @@ def main() -> None:
     parser.add_argument("--macro-blocks", type=int, default=1)
     parser.add_argument("--steps", type=int, default=1)
     parser.add_argument("--maximum-time", type=float, default=0.25)
-    parser.add_argument("--maximum-lambda", type=float, default=1.0)
+    parser.add_argument("--maximum-lambda", type=float, default=2.0)
     parser.add_argument("--initial-raw-T", type=float, default=2.0)
-    parser.add_argument("--initial-raw-lambda", type=float, default=0.0)
+    parser.add_argument("--initial-raw-lambda", type=float, default=2.0)
     parser.add_argument("--no-step-mask", action="store_true")
     parser.add_argument("--checkpoint-force", action="store_true")
     parser.add_argument("--no-amp", action="store_true")
