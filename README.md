@@ -142,6 +142,12 @@ The run writes `history.csv`, `history.png`, `reconstruction.png`,
 `NRMSE + beta_dc * ||W(A chi-b)||^2/N`; `beta_dc` is independent of the
 dynamics coefficient `lambda` and spatial reliability `W`.
 
+Before optimization begins, the training runner prints the complete model
+architecture followed by the number of microblocks, macroblocks, learned
+convolutions, total parameters, and trainable parameters. The convolution
+count includes every learned `AdjointConv3d`, including those inside scale
+operators, and excludes fixed binomial antialias filters.
+
 ## Data-only gradient-descent baseline
 
 The baseline evaluator reconstructs susceptibility without constructing or
@@ -172,6 +178,98 @@ same one-realization COSMOS noise simulation, magnitude rule, periodic dipole
 operator, mask, and susceptibility-reference convention as the training
 diagnostic. It writes `history.csv`, `history.png`, `reconstruction.png`,
 `reconstruction.pt`, and `report.json`.
+
+## Learned-regularizer evaluation
+
+The learned-regularizer evaluator accepts a model directory containing
+`checkpoint.pt` and `report.json`, restores `TDVEnergy3D`, and runs a fixed
+number of explicit reconstruction iterations:
+
+\[
+\chi_{s+1}=\chi_s
+-\tau_R\nabla R_\theta(\chi_s)
+-\tau_D A^H W^2(A\chi_s-b).
+\]
+
+By default, the evaluator loads the final per-step model weights directly from
+`report.json` at `taus.regularizer` and `taus.data`. It does not reconstruct
+them from raw checkpoint parameters. An explicit `taus` argument overrides
+the report values and is ordered as `tau_R` followed by `tau_D`. The Python
+API is:
+
+```python
+evaluate_learned_regularizers(
+    model_directory_path,
+    dataset_directory_path,
+    gradient_parameters,
+    total_iterations,
+    taus=None,
+    snr=None,
+)
+```
+
+`gradient_parameters` is a mapping that can override `device`,
+`voxel_size_zyx`, `b0_direction_zyx`, `snr`, `phase_scale`, `seed`,
+`mask_state_each_step`, `use_amp`, and `output_dir`. Architecture and physical
+metadata otherwise come from `checkpoint.pt` when available. The explicit
+`snr` argument takes precedence over both `gradient_parameters["snr"]` and the
+checkpoint value, and must be finite and positive.
+
+The evaluator conditionally resolves a COSMOS directory as follows:
+
+```text
+phase.mat present: load phase directly as b; do not run field simulation
+phase.mat absent: simulate b from chi.mat or chi_cosmos.mat at the configured SNR
+magn.mat present: store the supplied finite nonnegative magn directly as W
+magn.mat absent: use mask as W
+chi.mat present: compute ground-truth NRMSE after every iteration
+chi.mat absent: omit the ground-truth metric
+initial.mat present: use the supplied initial state
+initial.mat absent: use the masked weighted normal backprojection
+```
+
+The raw-`magn` evaluation rule and its exact `mask` fallback are specific to
+this evaluator. They do not replace the training runner's documented
+`W = sqrt(2) * magn` preprocessing rule.
+
+At iteration `s`, `tol_update` is
+
+\[
+\operatorname{NRMSE}(\chi_s,\chi_{s-1})
+=\frac{\|\chi_s-\chi_{s-1}\|_2}{\|\chi_{s-1}\|_2},
+\]
+
+so the immediately preceding state is treated as the NRMSE reference. When
+`chi.mat` is present, masked ground-truth NRMSE is recorded on the same
+iteration axis.
+
+```bash
+uv run tdv-qsm-evaluate-regularizers \
+  runs/cosmos-snr70 \
+  /cosmos_data \
+  --iterations 100 \
+  --snr 70 \
+  --gradient-parameters \
+  '{"voxel_size_zyx":[1,1,1],"b0_direction_zyx":[0,0,1]}' \
+  --output-dir runs/cosmos-regularizer-evaluation
+```
+
+`--gradient-parameters` accepts either a JSON object or a path to a JSON file.
+`--snr` controls complex-noise simulation when `phase.mat` is absent. When
+`phase.mat` exists, its field values are loaded directly and SNR does not alter
+them.
+Use optional `--taus TAU_REGULARIZER TAU_DATA` to override the report values.
+If `--taus` is omitted, `report.json` must contain finite nonnegative
+`taus.regularizer` and `taus.data` values. Training writes the final post-update
+values into this report so they correspond to the saved `checkpoint.pt`.
+The run writes `metrics.csv`, a two-panel `metrics.png` line chart with
+`tol_update` and ground-truth NRMSE in separate panels, `chi_pred.mat`, and
+`chi_pred.png`. Without `chi.mat`, the ground-truth panel is marked
+unavailable. The prediction figure reuses the COSMOS training diagnostic's
+three anatomical planes, radiological rotations, grayscale susceptibility
+range `[-0.1, 0.1]`, magma absolute-error colormap, layout, labels, and color
+bars. Without `chi.mat`, it produces the corresponding prediction-only
+three-plane grayscale view.
 
 Run all tests with:
 

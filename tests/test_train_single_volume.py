@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 
 import matplotlib.image as mpimg
@@ -15,10 +16,36 @@ from tdv_qsm.train import (
     TrainingConfig,
     _cosmos_display_planes,
     magnitude_weight,
+    print_model_architecture,
     simulate_noisy_local_field,
+    summarize_model_architecture,
     save_reconstruction_figure,
     train_single_volume,
 )
+
+
+def test_model_architecture_summary_counts_tdv_structure_and_parameters(capsys) -> None:
+    model = ExplicitTDVQSM3D(
+        TDVEnergy3D(num_features=2, num_macro_blocks=2, use_amp=False),
+        num_steps=1,
+    )
+
+    summary = summarize_model_architecture(model)
+
+    assert summary.microblocks == 10
+    assert summary.macroblocks == 2
+    assert summary.convolutions == 30
+    assert summary.total_parameters == sum(parameter.numel() for parameter in model.parameters())
+    assert summary.trainable_parameters == sum(
+        parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+    )
+    print_model_architecture(model)
+    output = capsys.readouterr().out
+    assert "ExplicitTDVQSM3D(" in output
+    assert "Microblocks: 10" in output
+    assert "Macroblocks: 2" in output
+    assert "Convolutions: 30" in output
+    assert f"Parameters: {summary.total_parameters:,}" in output
 
 
 def test_weight_rule_and_epoch_noise_are_explicit() -> None:
@@ -52,6 +79,16 @@ def test_tiny_training_writes_metrics_and_reconstruction(tmp_path) -> None:
     assert model.raw_lambda is not None and model.raw_lambda.grad is not None
     assert (tmp_path / "history.csv").is_file()
     assert (tmp_path / "reconstruction.png").is_file()
+    report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+    total_time, data_coefficient = model.coefficients()
+    assert math.isclose(
+        report["taus"]["regularizer"],
+        float(total_time.detach()) / model.num_steps,
+    )
+    assert math.isclose(
+        report["taus"]["data"],
+        float(data_coefficient.detach()) / model.num_steps,
+    )
 
 
 def test_100_synthetic_training_steps_stay_finite_and_reach_every_parameter() -> None:

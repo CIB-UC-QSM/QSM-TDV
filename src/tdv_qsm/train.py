@@ -22,8 +22,10 @@ import torch
 from scipy.io import loadmat
 
 from tdv_qsm.losses import mask_and_reference, nrmse, weighted_data_consistency_loss
+from tdv_qsm.models.blocks import MacroBlock3D, MicroBlock3D
 from tdv_qsm.models.energy import TDVEnergy3D
 from tdv_qsm.models.explicit_tdv import ExplicitTDVQSM3D
+from tdv_qsm.operators.convolution import AdjointConv3d
 from tdv_qsm.operators.dipole import DipoleOperator3D, build_dipole_kernel
 
 
@@ -34,6 +36,46 @@ class SingleVolume:
     susceptibility: torch.Tensor
     magnitude: torch.Tensor
     brain_mask: torch.Tensor
+
+
+@dataclass(frozen=True)
+class ModelArchitectureSummary:
+    microblocks: int
+    macroblocks: int
+    convolutions: int
+    total_parameters: int
+    trainable_parameters: int
+
+
+def summarize_model_architecture(
+    model: torch.nn.Module,
+) -> ModelArchitectureSummary:
+    modules = tuple(model.modules())
+    parameters = tuple(model.parameters())
+    return ModelArchitectureSummary(
+        microblocks=sum(isinstance(module, MicroBlock3D) for module in modules),
+        macroblocks=sum(isinstance(module, MacroBlock3D) for module in modules),
+        convolutions=sum(isinstance(module, AdjointConv3d) for module in modules),
+        total_parameters=sum(parameter.numel() for parameter in parameters),
+        trainable_parameters=sum(
+            parameter.numel() for parameter in parameters if parameter.requires_grad
+        ),
+    )
+
+
+def print_model_architecture(
+    model: torch.nn.Module,
+) -> ModelArchitectureSummary:
+    summary = summarize_model_architecture(model)
+    print("Model architecture:", flush=True)
+    print(model, flush=True)
+    print("Model summary:", flush=True)
+    print(f"  Microblocks: {summary.microblocks:,}", flush=True)
+    print(f"  Macroblocks: {summary.macroblocks:,}", flush=True)
+    print(f"  Convolutions: {summary.convolutions:,}", flush=True)
+    print(f"  Parameters: {summary.total_parameters:,}", flush=True)
+    print(f"  Trainable parameters: {summary.trainable_parameters:,}", flush=True)
+    return summary
 
 
 @dataclass(frozen=True)
@@ -190,8 +232,7 @@ def magnitude_weight(magnitude: torch.Tensor) -> torch.Tensor:
     weight and therefore removes that residual's data-term contribution.
     """
 
-    weight = magnitude.float()
-    weight /= weight.max()
+    weight = math.sqrt(2.0) * magnitude.float()
     if not torch.isfinite(weight).all() or torch.any(weight < 0.0):
         raise ValueError("magn must be finite and nonnegative.")
     return weight
@@ -429,6 +470,7 @@ def train_single_volume(
         mask_state_each_step=config.mask_state_each_step,
         checkpoint_force=config.checkpoint_force,
     ).to(device)
+    print_model_architecture(model)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
     weight = magnitude_weight(sample.magnitude)
@@ -585,6 +627,10 @@ def train_single_volume(
         "noise_rule": "Per epoch complex Gaussian signal noise; real/imag std = mean(magn inside brain_mask) / SNR",
         "image_display_range": [-0.1, 0.1],
         "final_nrmse": float(final_nrmse.detach().cpu()),
+        "taus": {
+            "regularizer": float(final_output.regularizer_step.detach().cpu()),
+            "data": float(final_output.data_step.detach().cpu()),
+        },
         "config": asdict(config),
     }
     (output_dir / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")

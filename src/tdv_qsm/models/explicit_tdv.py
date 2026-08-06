@@ -218,7 +218,7 @@ class ExplicitTDVQSM3D(nn.Module):
 
         total_time, data_coefficient = self.coefficients()
         regularizer_step = total_time.float() / self.num_steps
-        data_step = data_coefficient.float() #/ self.num_steps
+        data_step = data_coefficient.float() / self.num_steps
         chi = initial.float()
         states: list[torch.Tensor] | None = [chi] if return_states else None
         data_norms: list[torch.Tensor] = []
