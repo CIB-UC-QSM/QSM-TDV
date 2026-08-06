@@ -142,6 +142,37 @@ The run writes `history.csv`, `history.png`, `reconstruction.png`,
 `NRMSE + beta_dc * ||W(A chi-b)||^2/N`; `beta_dc` is independent of the
 dynamics coefficient `lambda` and spatial reliability `W`.
 
+## Data-only gradient-descent baseline
+
+The baseline evaluator reconstructs susceptibility without constructing or
+loading the learned TDV regularizer.  Starting from the same masked weighted
+backprojection used by the training diagnostic, it runs the fixed update
+
+\[
+\chi_{s+1}=\chi_s-\tau A^H W^2(A\chi_s-b).
+\]
+
+The iteration count is fixed before evaluation; ground truth is used only for
+the initial and final masked/referenced NRMSE and never for stopping or model
+selection. If `--step-size` is omitted, the evaluator uses the conservative
+value
+`1 / (||W||_inf^2 ||D||_inf^2)` without normalizing or otherwise changing
+`W` or `D`.
+
+```bash
+uv run tdv-qsm-gradient-baseline \
+  --data /cosmos_data \
+  --output-dir runs/cosmos-gradient-baseline \
+  --steps 100 \
+  --snr 70
+```
+
+Use `--step-size VALUE` to override the automatic step. The script uses the
+same one-realization COSMOS noise simulation, magnitude rule, periodic dipole
+operator, mask, and susceptibility-reference convention as the training
+diagnostic. It writes `history.csv`, `history.png`, `reconstruction.png`,
+`reconstruction.pt`, and `report.json`.
+
 Run all tests with:
 
 ```bash

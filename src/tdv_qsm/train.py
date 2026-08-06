@@ -183,7 +183,7 @@ def load_single_volume(location: Path, device: torch.device) -> SingleVolume:
 
 
 def magnitude_weight(magnitude: torch.Tensor) -> torch.Tensor:
-    """Return the stored diagonal ``W=sqrt(2)*magn`` (not ``sqrt(W)``).
+    """Return the stored diagonal ``W=magn`` (not ``sqrt(W)``).
 
     Input magnitudes are treated as dimensionless, are not normalized or
     clipped, and are not multiplied by a mask.  Zero magnitude maps to zero
@@ -191,6 +191,7 @@ def magnitude_weight(magnitude: torch.Tensor) -> torch.Tensor:
     """
 
     weight = magnitude.float()
+    weight /= weight.max()
     if not torch.isfinite(weight).all() or torch.any(weight < 0.0):
         raise ValueError("magn must be finite and nonnegative.")
     return weight
@@ -316,8 +317,10 @@ def save_reconstruction_figure(
     output_path: Path,
     *,
     nrmse_value: float | None = None,
+    prediction_title: str = r"TDV-QSM prediction $X_S$",
+    diagnostic_title: str = "COSMOS TDV-QSM overfit diagnostic",
 ) -> None:
-    """Save a three-plane COSMOS-style TDV diagnostic figure.
+    """Save a three-plane COSMOS-style reconstruction diagnostic figure.
 
     Susceptibility panels retain the fixed ``[-0.1, 0.1]`` display range.
     The final column is absolute error, displayed on the ``[0, 0.5]`` scale
@@ -340,7 +343,7 @@ def save_reconstruction_figure(
     )
     display_planes = tuple(_cosmos_display_planes(array) for array in arrays)
     error_planes = _cosmos_display_planes(absolute_error)
-    titles = ("Input $X_0$", "TDV-QSM prediction $X_S$", "Ground truth $X_{gt}$")
+    titles = ("Input $X_0$", prediction_title, "Ground truth $X_{gt}$")
     figure = plt.figure(figsize=(18, 13), constrained_layout=True)
     grid = figure.add_gridspec(3, 6, width_ratios=(1.0, 1.0, 1.0, 0.07, 1.0, 0.07))
     susceptibility_image = None
@@ -383,12 +386,11 @@ def save_reconstruction_figure(
     error_colorbar.set_label("Absolute error")
     if nrmse_value is not None:
         figure.suptitle(
-            "COSMOS TDV-QSM overfit diagnostic — "
-            f"masked NRMSE = {nrmse_value:.5f}",
+            f"{diagnostic_title} — masked NRMSE = {nrmse_value:.5f}",
             fontsize=14,
         )
     else:
-        figure.suptitle("COSMOS TDV-QSM overfit diagnostic", fontsize=14)
+        figure.suptitle(diagnostic_title, fontsize=14)
     figure.savefig(output_path, dpi=160)
     plt.close(figure)
 
