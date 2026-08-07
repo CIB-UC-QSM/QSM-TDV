@@ -170,10 +170,10 @@ backprojection used by the training diagnostic, it runs the fixed update
 \chi_{s+1}=\chi_s-\tau A^H W^2(A\chi_s-b).
 \]
 
-The iteration count is fixed before evaluation; ground truth is used only for
-the initial and final masked/referenced NRMSE and never for stopping or model
-selection. If `--step-size` is omitted, the evaluator uses the conservative
-value
+The iteration count is fixed before evaluation; when ground truth is present,
+it is used only for the initial and final masked/referenced NRMSE and never for
+stopping or model selection. If `--step-size` is omitted, the evaluator uses
+the conservative value
 `1 / (||W||_inf^2 ||D||_inf^2)` without normalizing or otherwise changing
 `W` or `D`.
 
@@ -185,10 +185,23 @@ uv run tdv-qsm-gradient-baseline \
   --snr 70
 ```
 
-Use `--step-size VALUE` to override the automatic step. The script uses the
-same one-realization COSMOS noise simulation, magnitude rule, periodic dipole
-operator, mask, and susceptibility-reference convention as the training
-diagnostic. It writes `history.csv`, `history.png`, `reconstruction.png`,
+Use `--step-size VALUE` to override the automatic step. Dataset directories use
+the same conditional loading contract as learned-regularizer evaluation:
+
+```text
+phase.mat present: load phase directly as b; do not run field simulation
+phase.mat absent: simulate b from chi.mat or chi_cosmos.mat at the configured SNR
+magn.mat present: store the supplied finite nonnegative magn directly as W
+magn.mat absent: use mask as W
+chi.mat present: compute initial and final ground-truth NRMSE
+chi.mat absent: omit the ground-truth metrics
+initial.mat present: use the supplied initial state
+initial.mat absent: use the masked weighted normal backprojection
+```
+
+Legacy self-contained COSMOS MAT/NPZ inputs are still accepted. The evaluator
+uses the periodic dipole operator and configured susceptibility-reference
+convention, and writes `history.csv`, `history.png`, `reconstruction.png`,
 `reconstruction.pt`, and `report.json`.
 
 ## Learned-regularizer evaluation

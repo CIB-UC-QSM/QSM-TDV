@@ -21,10 +21,12 @@ from pathlib import Path
 
 import torch
 
+from tdv_qsm.evaluate_regularizers import EvaluationData, _load_evaluation_data
 from tdv_qsm.losses import mask_and_reference, nrmse
 from tdv_qsm.operators.dipole import QSMOperator, build_dipole_kernel
 from tdv_qsm.train import (
     SingleVolume,
+    _cosmos_display_planes,
     _pyplot,
     initial_backprojection,
     load_single_volume,
@@ -48,7 +50,7 @@ class GradientDescentOutput:
 
 @dataclass(frozen=True)
 class GradientBaselineConfig:
-    """Configuration for a same-volume COSMOS baseline evaluation."""
+    """Configuration for a single-volume baseline evaluation."""
 
     num_steps: int = 100
     step_size: float | None = None
@@ -256,33 +258,139 @@ def _write_history(output: GradientDescentOutput, output_dir: Path) -> None:
     plt.close(figure)
 
 
+def _save_prediction_only_figure(
+    prediction: torch.Tensor,
+    output_path: Path,
+) -> None:
+    plt = _pyplot()
+    array = prediction.detach().float().cpu().numpy()[0, 0]
+    display_planes = _cosmos_display_planes(array)
+    planes = (
+        ("Sagittal", "Y", "Z", 0),
+        ("Coronal", "Z", "X", 1),
+        ("Axial", "Y", "X", 2),
+    )
+    figure = plt.figure(figsize=(18, 13), constrained_layout=True)
+    grid = figure.add_gridspec(3, 2, width_ratios=(1.0, 0.07))
+    susceptibility_image = None
+    for row, (plane_name, x_label, y_label, plane_index) in enumerate(planes):
+        axis = figure.add_subplot(grid[row, 0])
+        susceptibility_image = axis.imshow(
+            display_planes[plane_index],
+            cmap="gray",
+            vmin=-0.1,
+            vmax=0.1,
+        )
+        if row == 0:
+            axis.set_title(r"Gradient-descent QSM prediction $X_S$")
+        axis.set_ylabel(f"{plane_name}\n{y_label}")
+        axis.set_xlabel(x_label)
+        axis.set_xticks([])
+        axis.set_yticks([])
+    assert susceptibility_image is not None
+    colorbar = figure.colorbar(
+        susceptibility_image,
+        cax=figure.add_subplot(grid[:, 1]),
+    )
+    colorbar.set_label("Susceptibility (source units)")
+    figure.suptitle("Data-only gradient-descent baseline", fontsize=14)
+    figure.savefig(output_path, dpi=160)
+    plt.close(figure)
+
+
+def _evaluation_data(
+    source: SingleVolume | str | Path,
+    device: torch.device,
+) -> EvaluationData:
+    if isinstance(source, (str, Path)) and Path(source).is_file():
+        source = load_single_volume(Path(source), device)
+    if not isinstance(source, SingleVolume):
+        return _load_evaluation_data(source, device)
+    susceptibility = source.susceptibility.to(device=device, dtype=torch.float32)
+    brain_mask = source.brain_mask.to(device=device, dtype=torch.float32)
+    weight = magnitude_weight(
+        source.magnitude.to(device=device, dtype=torch.float32)
+    )
+    return EvaluationData(
+        local_field=None,
+        brain_mask=brain_mask,
+        weight=weight,
+        ground_truth=susceptibility,
+        phase_was_provided=False,
+        weight_source="magn",
+        simulation_susceptibility=susceptibility,
+    )
+
+
 def evaluate_gradient_baseline(
-    sample: SingleVolume,
+    sample: SingleVolume | str | Path,
     config: GradientBaselineConfig,
     output_dir: Path,
+    *,
+    device: torch.device | str | None = None,
 ) -> tuple[GradientDescentOutput, dict[str, float]]:
-    """Evaluate a data-only baseline on one COSMOS-style synthetic field."""
+    """Evaluate the data-only baseline on a legacy volume or dataset directory.
 
+    Dataset directories follow the learned-regularizer evaluation contract:
+    ``phase.mat`` is used directly when present, ``mask`` is the fallback for a
+    missing ``magn``, ``chi`` is optional ground truth, and ``initial`` is an
+    optional supplied starting point.  A field is simulated from ``chi`` only
+    when no phase file is available.
+    """
+
+    if device is None:
+        resolved_device = (
+            sample.susceptibility.device
+            if isinstance(sample, SingleVolume)
+            else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        )
+    else:
+        resolved_device = torch.device(device)
+    data = _evaluation_data(sample, resolved_device)
     output_dir.mkdir(parents=True, exist_ok=True)
-    device = sample.susceptibility.device
     kernel = build_dipole_kernel(
-        sample.susceptibility.shape[-3:],
+        data.brain_mask.shape[-3:],
         config.voxel_size_zyx,
         config.b0_direction_zyx,
-        device=device,
+        device=resolved_device,
     )
     operator = QSMOperator(kernel)
-    weight = magnitude_weight(sample.magnitude)
-    local_field = simulate_noisy_local_field(
-        sample.susceptibility,
-        sample.magnitude,
-        sample.brain_mask,
-        operator,
-        snr=config.snr,
-        phase_scale=config.phase_scale,
-        seed=config.seed,
+    weight = data.weight.float()
+    if data.phase_was_provided:
+        if data.local_field is None:
+            raise RuntimeError("phase.mat was detected but phase data was not loaded.")
+        local_field = data.local_field.float()
+        field_source = "phase.mat"
+        noise_rule = "Not applied; phase.mat was loaded directly as the local field"
+    else:
+        if data.simulation_susceptibility is None:
+            raise FileNotFoundError(
+                "Without phase.mat, chi.mat or chi_cosmos.mat is required for simulation."
+            )
+        local_field = simulate_noisy_local_field(
+            data.simulation_susceptibility,
+            weight,
+            data.brain_mask,
+            operator,
+            snr=config.snr,
+            phase_scale=config.phase_scale,
+            seed=config.seed,
+        )
+        field_source = "simulation from supplied susceptibility"
+        noise_rule = (
+            "One complex Gaussian signal-noise realization; real/imag std = "
+            "maximum magn inside brain_mask / SNR"
+        )
+    initial = (
+        data.initial.float()
+        if data.initial is not None
+        else initial_backprojection(local_field, weight, data.brain_mask, operator)
     )
-    initial = initial_backprojection(local_field, weight, sample.brain_mask, operator)
+    initialization_rule = (
+        "supplied initial.mat"
+        if data.initial is not None
+        else "masked A^H W^2 b backprojection"
+    )
     lipschitz_bound = conservative_lipschitz_bound(weight, kernel)
     if config.step_size is None:
         resolved_step_size = 1.0 / lipschitz_bound if lipschitz_bound > 0.0 else 1.0
@@ -297,60 +405,68 @@ def evaluate_gradient_baseline(
             weight,
             initial,
             operator,
-            brain_mask=sample.brain_mask,
+            brain_mask=data.brain_mask,
             num_steps=config.num_steps,
             step_size=resolved_step_size,
             mask_state_each_step=config.mask_state_each_step,
         )
-        target = mask_and_reference(
-            sample.susceptibility,
-            sample.brain_mask,
-            convention=config.reference_convention,
-        )
         initial_evaluation = mask_and_reference(
             initial,
-            sample.brain_mask,
+            data.brain_mask,
             convention=config.reference_convention,
         )
         prediction = mask_and_reference(
             output.susceptibility,
-            sample.brain_mask,
+            data.brain_mask,
             convention=config.reference_convention,
         )
-        initial_nrmse = nrmse(initial_evaluation, target)
-        final_nrmse = nrmse(prediction, target)
 
     metrics = {
-        "initial_nrmse": float(initial_nrmse.cpu()),
-        "final_nrmse": float(final_nrmse.cpu()),
         "initial_data_energy": float(output.data_energy[0].mean().cpu()),
         "final_data_energy": float(output.data_energy[-1].mean().cpu()),
         "final_data_gradient_norm": float(output.data_gradient_norm[-1].mean().cpu()),
         "resolved_step_size": float(resolved_step_size),
         "conservative_lipschitz_bound": float(lipschitz_bound),
     }
+    target = None
+    if data.ground_truth is not None:
+        with torch.no_grad():
+            target = mask_and_reference(
+                data.ground_truth,
+                data.brain_mask,
+                convention=config.reference_convention,
+            )
+            metrics["initial_nrmse"] = float(nrmse(initial_evaluation, target).cpu())
+            metrics["final_nrmse"] = float(nrmse(prediction, target).cpu())
     if not all(math.isfinite(value) for value in metrics.values()):
         raise FloatingPointError("Non-finite baseline metric.")
 
     _write_history(output, output_dir)
-    save_reconstruction_figure(
-        initial_evaluation,
-        prediction,
-        target,
-        output_dir / "reconstruction.png",
-        nrmse_value=metrics["final_nrmse"],
-        prediction_title=r"Gradient-descent QSM $X_S$",
-        diagnostic_title="COSMOS data-only gradient-descent baseline",
-    )
+    if target is None:
+        _save_prediction_only_figure(prediction, output_dir / "reconstruction.png")
+    else:
+        save_reconstruction_figure(
+            initial_evaluation,
+            prediction,
+            target,
+            output_dir / "reconstruction.png",
+            nrmse_value=metrics["final_nrmse"],
+            prediction_title=r"Gradient-descent QSM $X_S$",
+            diagnostic_title="Data-only gradient-descent baseline",
+        )
     torch.save(
         {
             "initial": initial.detach().cpu(),
             "local_field": local_field.detach().cpu(),
             "magnitude_weight": weight.detach().cpu(),
-            "brain_mask": sample.brain_mask.detach().cpu(),
+            "brain_mask": data.brain_mask.detach().cpu(),
             "susceptibility": output.susceptibility.detach().cpu(),
             "predicted_field": output.predicted_field.detach().cpu(),
-            "ground_truth": sample.susceptibility.detach().cpu(),
+            "ground_truth": (
+                data.ground_truth.detach().cpu()
+                if data.ground_truth is not None
+                else None
+            ),
             "dipole_kernel": kernel.detach().cpu(),
             "config": asdict(config),
             "metrics": metrics,
@@ -364,12 +480,19 @@ def evaluate_gradient_baseline(
         "data_gradient": "A^H W^2 (A chi - b)",
         "update": "chi_(s+1) = chi_s - step_size * data_gradient",
         "selection_rule": "fixed iteration count; ground truth is not used for stopping",
-        "initialization": "masked A^H W^2 b backprojection",
+        "initialization": initialization_rule,
         "step_size_rule": step_size_rule,
         "physical_model": "b = F^H D F chi + eta; periodic unitary FFT, no padding/cropping/TKD",
-        "weight_rule": "Stored W (not sqrt(W)) = dimensionless magn; no normalization, clipping, or mask multiplication; zero magn gives W=0",
+        "field_source": field_source,
+        "weight_source": data.weight_source,
+        "weight_rule": (
+            "Stored W (not sqrt(W)) = dimensionless magn; no normalization, clipping, "
+            "or mask multiplication; zero magn gives W=0"
+            if data.weight_source == "magn"
+            else "Stored W (not sqrt(W)) = mask because magn.mat was absent"
+        ),
         "susceptibility_reference_convention": config.reference_convention,
-        "noise_rule": "One complex Gaussian signal-noise realization; real/imag std = mean(magn inside brain_mask) / SNR",
+        "noise_rule": noise_rule,
         "source_provenance": "The baseline uses project-specific 3-D QSM physics and medical-volume handling; it contains no TDV regularizer",
         "metrics": metrics,
         "config": asdict(config),
@@ -403,7 +526,11 @@ def main() -> None:
         "--data",
         type=Path,
         default=Path("/cosmos_data"),
-        help="COSMOS directory, MAT, or NPZ file.",
+        help=(
+            "Dataset directory using the learned-evaluator phase/mask/magn/chi/initial "
+            "MAT-file contract. Legacy self-contained COSMOS MAT/NPZ inputs are also "
+            "accepted."
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -446,14 +573,17 @@ def main() -> None:
     parser.add_argument("--device", default=None, help="Defaults to CUDA when available, else CPU.")
     arguments = parser.parse_args()
     device = torch.device(arguments.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    sample = load_single_volume(arguments.data, device)
     _, metrics = evaluate_gradient_baseline(
-        sample,
+        arguments.data,
         _configuration_from_args(arguments),
         arguments.output_dir,
+        device=device,
     )
-    print(f"Initial NRMSE: {metrics['initial_nrmse']:.6e}")
-    print(f"Final NRMSE:   {metrics['final_nrmse']:.6e}")
+    if "initial_nrmse" in metrics:
+        print(f"Initial NRMSE: {metrics['initial_nrmse']:.6e}")
+        print(f"Final NRMSE:   {metrics['final_nrmse']:.6e}")
+    else:
+        print("Ground-truth NRMSE: unavailable (chi.mat was not supplied)")
     print(f"Step size:     {metrics['resolved_step_size']:.6e}")
     print(f"Wrote {arguments.output_dir / 'reconstruction.png'}")
 

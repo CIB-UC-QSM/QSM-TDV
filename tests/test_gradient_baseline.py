@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 
+import numpy as np
 import torch
+from scipy.io import savemat
 
+import tdv_qsm.gradient_baseline as baseline_module
 from tdv_qsm.gradient_baseline import (
     GradientBaselineConfig,
     evaluate_gradient_baseline,
@@ -109,3 +112,51 @@ def test_baseline_evaluation_writes_reconstruction_metrics_and_conventions(tmp_p
     assert report["data_gradient"] == "A^H W^2 (A chi - b)"
     assert report["selection_rule"] == "fixed iteration count; ground truth is not used for stopping"
     assert report["weight_rule"].startswith("Stored W (not sqrt(W)) = dimensionless magn")
+
+
+def test_baseline_evaluation_accepts_direct_phase_dataset_without_ground_truth(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    shape = (4, 4, 4)
+    data_directory = tmp_path / "measured"
+    data_directory.mkdir()
+    phase = np.linspace(-0.01, 0.01, np.prod(shape), dtype=np.float32).reshape(shape)
+    mask = np.ones(shape, dtype=np.float32)
+    initial = np.full(shape, 0.02, dtype=np.float32)
+    savemat(data_directory / "phase.mat", {"phase": phase})
+    savemat(data_directory / "mask.mat", {"mask": mask})
+    savemat(data_directory / "initial.mat", {"initial": initial})
+
+    def fail_simulation(*args, **kwargs):
+        raise AssertionError("phase.mat must bypass forward simulation")
+
+    monkeypatch.setattr(
+        baseline_module,
+        "simulate_noisy_local_field",
+        fail_simulation,
+    )
+    output_directory = tmp_path / "output"
+
+    output, metrics = evaluate_gradient_baseline(
+        data_directory,
+        GradientBaselineConfig(num_steps=1, step_size=0.1),
+        output_directory,
+    )
+
+    saved = torch.load(
+        output_directory / "reconstruction.pt",
+        map_location="cpu",
+        weights_only=True,
+    )
+    torch.testing.assert_close(saved["local_field"][0, 0], torch.from_numpy(phase))
+    torch.testing.assert_close(saved["magnitude_weight"][0, 0], torch.from_numpy(mask))
+    torch.testing.assert_close(saved["initial"][0, 0], torch.from_numpy(initial))
+    assert saved["ground_truth"] is None
+    assert output.susceptibility.shape == (1, 1, *shape)
+    assert "initial_nrmse" not in metrics
+    assert "final_nrmse" not in metrics
+    assert (output_directory / "reconstruction.png").is_file()
+    report = json.loads((output_directory / "report.json").read_text(encoding="utf-8"))
+    assert report["field_source"] == "phase.mat"
+    assert report["weight_source"] == "mask"
