@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -14,6 +15,22 @@ from tdv_qsm.gradient_baseline import (
 )
 from tdv_qsm.operators.dipole import QSMOperator, build_dipole_kernel
 from tdv_qsm.train import SingleVolume
+
+
+class IdentityOperator:
+    def forward(
+        self,
+        chi: torch.Tensor,
+        dipole_kernel: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return chi
+
+    def adjoint(
+        self,
+        field: torch.Tensor,
+        dipole_kernel: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return field
 
 
 def test_gradient_descent_step_is_exact_weight_squared_data_update() -> None:
@@ -82,6 +99,84 @@ def test_gradient_descent_masks_state_and_rejects_invalid_weights() -> None:
         raise AssertionError("Negative magnitude weights must be rejected.")
 
 
+def test_gradient_descent_records_ground_truth_nrmse_at_every_iteration() -> None:
+    shape = (2, 3, 4)
+    initial = torch.full((1, 1, *shape), 2.0)
+    local_field = torch.zeros_like(initial)
+    weight = torch.ones_like(initial)
+    mask = torch.ones_like(initial)
+    ground_truth = torch.ones_like(initial)
+
+    output = gradient_descent_qsm(
+        local_field,
+        weight,
+        initial,
+        IdentityOperator(),
+        brain_mask=mask,
+        ground_truth=ground_truth,
+        num_steps=2,
+        step_size=0.25,
+    )
+
+    assert output.ground_truth_nrmse is not None
+    torch.testing.assert_close(
+        output.ground_truth_nrmse,
+        torch.tensor([1.0, 0.5, 0.125]),
+    )
+
+
+def test_history_figure_replaces_gradient_norm_panel_with_nrmse(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    calls: dict[str, object] = {"plots": [], "titles": [], "yscales": []}
+
+    class Axis:
+        def plot(self, iterations, values, **kwargs):
+            calls["plots"].append(list(values))
+
+        def set(self, **kwargs):
+            calls["titles"].append(kwargs["title"])
+
+        def set_yscale(self, scale):
+            calls["yscales"].append(scale)
+
+        def grid(self, **kwargs):
+            return None
+
+        def text(self, *args, **kwargs):
+            return None
+
+    class Figure:
+        def savefig(self, path, **kwargs):
+            calls["output_path"] = path
+
+    class Pyplot:
+        def subplots(self, rows, columns, **kwargs):
+            return Figure(), [Axis(), Axis()]
+
+        def close(self, figure):
+            return None
+
+    monkeypatch.setattr(baseline_module, "_pyplot", lambda: Pyplot())
+    output = SimpleNamespace(
+        data_energy=torch.tensor([[4.0], [3.0]]),
+        data_gradient_norm=torch.tensor([[2.0], [1.0]]),
+        state_norm=torch.tensor([[5.0], [4.0]]),
+        ground_truth_nrmse=torch.tensor([0.5, 0.25]),
+    )
+
+    baseline_module._write_history(output, tmp_path)
+
+    assert calls["plots"] == [[4.0, 3.0], [0.5, 0.25]]
+    assert calls["titles"][1] == "Ground-truth NRMSE"
+    assert calls["yscales"] == ["log"]
+    assert calls["output_path"] == tmp_path / "history.png"
+    assert "ground_truth_nrmse" in (tmp_path / "history.csv").read_text(
+        encoding="utf-8"
+    ).splitlines()[0]
+
+
 def test_baseline_evaluation_writes_reconstruction_metrics_and_conventions(tmp_path) -> None:
     torch.manual_seed(4)
     shape = (4, 4, 4)
@@ -101,6 +196,9 @@ def test_baseline_evaluation_writes_reconstruction_metrics_and_conventions(tmp_p
 
     assert output.susceptibility.shape == sample.susceptibility.shape
     assert torch.isfinite(output.susceptibility).all()
+    assert output.ground_truth_nrmse is not None
+    assert output.ground_truth_nrmse.shape == (config.num_steps + 1,)
+    assert metrics["final_nrmse"] == float(output.ground_truth_nrmse[-1].cpu())
     assert metrics["final_nrmse"] >= 0.0
     assert metrics["resolved_step_size"] > 0.0
     assert (tmp_path / "history.csv").is_file()
@@ -154,6 +252,8 @@ def test_baseline_evaluation_accepts_direct_phase_dataset_without_ground_truth(
     torch.testing.assert_close(saved["initial"][0, 0], torch.from_numpy(initial))
     assert saved["ground_truth"] is None
     assert output.susceptibility.shape == (1, 1, *shape)
+    assert output.ground_truth_nrmse is None
+    assert saved["ground_truth_nrmse"] is None
     assert "initial_nrmse" not in metrics
     assert "final_nrmse" not in metrics
     assert (output_directory / "reconstruction.png").is_file()

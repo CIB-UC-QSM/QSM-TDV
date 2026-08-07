@@ -202,7 +202,10 @@ initial.mat absent: use the masked weighted normal backprojection
 Legacy self-contained COSMOS MAT/NPZ inputs are still accepted. The evaluator
 uses the periodic dipole operator and configured susceptibility-reference
 convention, and writes `history.csv`, `history.png`, `reconstruction.png`,
-`reconstruction.pt`, and `report.json`.
+`reconstruction.pt`, and `report.json`. When `chi.mat` is available,
+`history.csv` records masked/referenced NRMSE at iteration zero and after every
+update, and the second panel of `history.png` displays that NRMSE trajectory.
+Without ground truth, the panel is marked unavailable.
 
 ## Learned-regularizer evaluation
 

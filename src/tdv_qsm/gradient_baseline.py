@@ -45,6 +45,7 @@ class GradientDescentOutput:
     data_energy: torch.Tensor
     data_gradient_norm: torch.Tensor
     state_norm: torch.Tensor
+    ground_truth_nrmse: torch.Tensor | None
     step_size: torch.Tensor
 
 
@@ -146,6 +147,8 @@ def gradient_descent_qsm(
     operator: QSMOperator,
     *,
     brain_mask: torch.Tensor | None = None,
+    ground_truth: torch.Tensor | None = None,
+    reference_convention: str = "already_referenced",
     dipole_kernel: torch.Tensor | None = None,
     num_steps: int,
     step_size: float,
@@ -154,8 +157,10 @@ def gradient_descent_qsm(
     """Run fixed-step descent on ``0.5 ||W(A chi - b)||^2`` only.
 
     No learned regularizer or learned coefficient participates in the update.
-    The returned histories have shape ``[num_steps + 1, B]`` and include the
-    initial and final states without retaining the 3-D intermediate states.
+    The physical histories have shape ``[num_steps + 1, B]``.  When ground
+    truth is supplied, ``ground_truth_nrmse`` has shape ``[num_steps + 1]`` and
+    contains the batch-mean masked/referenced NRMSE, including iteration zero.
+    No 3-D intermediate states are retained.
     """
 
     if num_steps < 1:
@@ -172,6 +177,28 @@ def gradient_descent_qsm(
     data_energies: list[torch.Tensor] = []
     gradient_norms: list[torch.Tensor] = []
     state_norms: list[torch.Tensor] = []
+    ground_truth_nrmse_history: list[torch.Tensor] = []
+    target = None
+    evaluation_mask = brain_mask
+    if ground_truth is not None:
+        ground_truth = _require_image("ground_truth", ground_truth, local_field)
+        if evaluation_mask is None:
+            evaluation_mask = torch.ones_like(local_field)
+        target = mask_and_reference(
+            ground_truth,
+            evaluation_mask,
+            convention=reference_convention,
+        )
+
+    def record_ground_truth_nrmse(state: torch.Tensor) -> None:
+        if target is None or evaluation_mask is None:
+            return
+        evaluation = mask_and_reference(
+            state,
+            evaluation_mask,
+            convention=reference_convention,
+        )
+        ground_truth_nrmse_history.append(nrmse(evaluation, target).detach())
 
     for _ in range(num_steps):
         predicted_field = operator.forward(chi.float(), dipole_kernel)
@@ -180,6 +207,7 @@ def gradient_descent_qsm(
         data_energies.append(_data_energy(weight, residual).detach())
         gradient_norms.append(_norm(data_force).detach())
         state_norms.append(_norm(chi).detach())
+        record_ground_truth_nrmse(chi)
         chi = chi - step * data_force
         if mask_state_each_step and brain_mask is not None:
             chi = chi * brain_mask
@@ -196,12 +224,18 @@ def gradient_descent_qsm(
     data_energies.append(_data_energy(weight, final_residual).detach())
     gradient_norms.append(_norm(final_force).detach())
     state_norms.append(_norm(chi).detach())
+    record_ground_truth_nrmse(chi)
     return GradientDescentOutput(
         susceptibility=chi,
         predicted_field=predicted_field,
         data_energy=torch.stack(data_energies),
         data_gradient_norm=torch.stack(gradient_norms),
         state_norm=torch.stack(state_norms),
+        ground_truth_nrmse=(
+            torch.stack(ground_truth_nrmse_history)
+            if ground_truth_nrmse_history
+            else None
+        ),
         step_size=step,
     )
 
@@ -224,15 +258,24 @@ def conservative_lipschitz_bound(
 
 def _write_history(output: GradientDescentOutput, output_dir: Path) -> None:
     iterations = list(range(output.data_energy.shape[0]))
-    rows = [
-        {
+    if (
+        output.ground_truth_nrmse is not None
+        and output.ground_truth_nrmse.numel() != len(iterations)
+    ):
+        raise ValueError("ground_truth_nrmse must contain one value per iteration.")
+    rows: list[dict[str, float | int]] = []
+    for iteration in iterations:
+        row: dict[str, float | int] = {
             "iteration": iteration,
             "data_energy": float(output.data_energy[iteration].mean().cpu()),
             "data_gradient_norm": float(output.data_gradient_norm[iteration].mean().cpu()),
             "state_norm": float(output.state_norm[iteration].mean().cpu()),
         }
-        for iteration in iterations
-    ]
+        if output.ground_truth_nrmse is not None:
+            row["ground_truth_nrmse"] = float(
+                output.ground_truth_nrmse[iteration].cpu()
+            )
+        rows.append(row)
     with (output_dir / "history.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
         writer.writeheader()
@@ -245,14 +288,27 @@ def _write_history(output: GradientDescentOutput, output_dir: Path) -> None:
         title=r"Data energy $\frac{1}{2}\Vert W(A\chi-b)\Vert^2$",
         xlabel="Iteration",
     )
-    axes[1].plot(
-        iterations,
-        [row["data_gradient_norm"] for row in rows],
-        color="tab:orange",
+    if output.ground_truth_nrmse is not None:
+        axes[1].plot(
+            iterations,
+            [row["ground_truth_nrmse"] for row in rows],
+            color="tab:orange",
+        )
+    else:
+        axes[1].text(
+            0.5,
+            0.5,
+            "Unavailable without chi.mat",
+            horizontalalignment="center",
+            verticalalignment="center",
+        )
+    axes[1].set(
+        title="Ground-truth NRMSE",
+        xlabel="Iteration",
+        ylabel="NRMSE",
     )
-    axes[1].set(title="Data-gradient norm", xlabel="Iteration")
+    axes[0].set_yscale("log")
     for axis in axes:
-        axis.set_yscale("log")
         axis.grid(alpha=0.25)
     figure.savefig(output_dir / "history.png", dpi=160)
     plt.close(figure)
@@ -406,6 +462,8 @@ def evaluate_gradient_baseline(
             initial,
             operator,
             brain_mask=data.brain_mask,
+            ground_truth=data.ground_truth,
+            reference_convention=config.reference_convention,
             num_steps=config.num_steps,
             step_size=resolved_step_size,
             mask_state_each_step=config.mask_state_each_step,
@@ -430,14 +488,16 @@ def evaluate_gradient_baseline(
     }
     target = None
     if data.ground_truth is not None:
+        if output.ground_truth_nrmse is None:
+            raise RuntimeError("Ground-truth NRMSE history was not recorded.")
         with torch.no_grad():
             target = mask_and_reference(
                 data.ground_truth,
                 data.brain_mask,
                 convention=config.reference_convention,
             )
-            metrics["initial_nrmse"] = float(nrmse(initial_evaluation, target).cpu())
-            metrics["final_nrmse"] = float(nrmse(prediction, target).cpu())
+        metrics["initial_nrmse"] = float(output.ground_truth_nrmse[0].cpu())
+        metrics["final_nrmse"] = float(output.ground_truth_nrmse[-1].cpu())
     if not all(math.isfinite(value) for value in metrics.values()):
         raise FloatingPointError("Non-finite baseline metric.")
 
@@ -465,6 +525,11 @@ def evaluate_gradient_baseline(
             "ground_truth": (
                 data.ground_truth.detach().cpu()
                 if data.ground_truth is not None
+                else None
+            ),
+            "ground_truth_nrmse": (
+                output.ground_truth_nrmse.detach().cpu()
+                if output.ground_truth_nrmse is not None
                 else None
             ),
             "dipole_kernel": kernel.detach().cpu(),
